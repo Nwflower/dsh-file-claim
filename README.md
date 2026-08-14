@@ -120,6 +120,10 @@ only protects the write surface. Shell-path parsing (`bash`/`pwsh`) is best-effo
 **never** treated as write targets — they are data, URLs or patterns, not files being written —
 and commands that yield no parseable target pass through (fail-open).
 
+With `guardCommit: true`, a `git commit` that explicitly stages paths actively claimed by another
+session (`git commit -- <path>` or legacy `git commit <path>`) is also denied; commit messages are
+never inspected, and a bare `git commit` (no paths) passes through — its scope cannot be known.
+
 ## Configuration
 
 Passed as plugin config in the bundle (`cordis.patch.yml`):
@@ -129,10 +133,20 @@ Passed as plugin config in the bundle (`cordis.patch.yml`):
 | `staleMs` | `7200000` (2h) | Heartbeat expiry before a session is considered stale |
 | `stateDirName` | `.dsh-file-claim` | Registry + pending area directory under the workspace root |
 | `guard` | `true` | Set `false` to disable the pre-execute write guard |
+| `guardCommit` | `false` | Opt-in: also deny `git commit` that explicitly stages paths actively claimed by another session |
 | `heartbeatMs` | `600000` (10min) | Fallback heartbeat interval |
 
 The claim registry and pending area live in `<workspaceRoot>/<stateDirName>/` — recommend adding it
 to `.gitignore`. State survives restarts; nothing ever touches `.git/`.
+
+## Audit Log
+
+Every business mutation — claim, takeover, release, pending write / apply / drop, prune, drop — is
+appended as one JSON line to `<stateDir>/audit.jsonl` (`{ at, tag, type, paths/path, detail }`),
+for traceability and post-crash reconciliation. Heartbeats are intentionally **not** logged (noise).
+`node claim.mjs audit [n]` prints the latest `n` entries (default 10); `claim_status` always shows
+the three most recent. Audit writes are append-only and never block or alter claim semantics; a
+failed audit append surfaces a warning line without failing the operation.
 
 ## Pending Merge Area
 

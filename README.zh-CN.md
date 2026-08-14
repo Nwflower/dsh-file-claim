@@ -108,6 +108,10 @@ shell 路径解析（`bash`/`pwsh`）为尽力而为：只提取**重定向目�
 `Remove-Item` / `Rename-Item`；bash `tee` / `dd of=` / `cp` / `mv` / `rm`）。**引号字面量绝不
 视为写目标**——它们是数据/URL/模式，不是要写的文件；解析不出目标即放行（fail-open）。
 
+开启 `guardCommit: true` 后，`git commit` **显式**提交其他会话活跃认领路径（`git commit -- <path>`
+或老语法 `git commit <path>`）也会被拒绝；提交信息（message）绝不检查，裸 `git commit`（无路径）
+放行——其改动范围无法获知。
+
 ## 配置
 
 在 bundle（`cordis.patch.yml`）中作为插件 config 传入：
@@ -117,10 +121,19 @@ shell 路径解析（`bash`/`pwsh`）为尽力而为：只提取**重定向目�
 | `staleMs` | `7200000`（2h） | 心跳过期多久视为 stale |
 | `stateDirName` | `.dsh-file-claim` | 工作区根下的注册表 + 待合并区目录名 |
 | `guard` | `true` | 设 `false` 关闭 pre-execute 写入守卫 |
+| `guardCommit` | `false` | 可选：额外拦截 `git commit` 显式提交其他会话活跃认领的路径 |
 | `heartbeatMs` | `600000`（10min） | 兜底心跳间隔 |
 
 认领注册表与待合并区位于 `<工作区根>/<stateDirName>/`——建议加入 `.gitignore`。状态跨重启
 保留；绝不触碰 `.git/`。
+
+## 审计日志
+
+每个业务变更——claim、接管、release、pending 写/apply/drop、prune、drop——都以一行 JSON
+追加到 `<stateDir>/audit.jsonl`（`{ at, tag, type, paths/path, detail }`），供追溯与崩溃后核对。
+心跳**刻意不记**（避免噪音）。`node claim.mjs audit [n]` 打印最近 `n` 条（默认 10）；
+`claim_status` 恒显示最近 3 条。审计只追加、不参与也不改变认领语义；审计写入失败只会提示
+警告行，不阻断操作。
 
 ## Pending 合并区
 

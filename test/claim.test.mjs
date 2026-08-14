@@ -158,7 +158,8 @@ test('prune 只清理 stale；drop 对活跃会话需 --force', async () => {
     expect(pruned, 0, 's-old')
     const st = await run(['status'], { stateDir: dir, repoRoot: root, env: smallStale, now: t1 })
     expect(st, 0, 's-new')
-    assert.ok(!st.lines.join('\n').includes('s-old'))
+    // 会话列表不再有 s-old（审计行是历史记录，可能含该 tag，只断言会话行）
+    assert.ok(!st.lines.some((l) => l.includes('会话 s-old')))
   } finally {
     await rm(dir, { recursive: true, force: true })
     await rm(root, { recursive: true, force: true })
@@ -307,6 +308,33 @@ test('pending 写/合并需要身份；list/show 只读不需要', async () => {
     expect(noTag, 1, '无法确定会话身份')
     const list = await run(['pending', 'list'], { stateDir: dir, repoRoot: root, env: bare })
     expect(list, 0, '待合并区为空')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('audit：claim/release 操作写入 audit.jsonl；audit 命令与 status 可读', async () => {
+  const dir = await tmpState()
+  const root = await tmpState()
+  try {
+    await run(['claim', '--as', 's-a', 'README.md'], { stateDir: dir, repoRoot: root })
+    await run(['release', '--as', 's-a', '--all'], { stateDir: dir, repoRoot: root })
+    // audit 命令看到 claim/release 记录
+    const au = await run(['audit'], { stateDir: dir, repoRoot: root })
+    expect(au, 0, 'claim', 'release', 'README.md')
+    // status 末尾显示最近审计
+    const st = await run(['status'], { stateDir: dir, repoRoot: root })
+    expect(st, 0, '最近审计')
+    // audit.jsonl 每行是合法 JSON 事件
+    const raw = await readFile(join(dir, 'audit.jsonl'), 'utf8')
+    const entries = raw.split('\n').filter(Boolean).map((l) => JSON.parse(l))
+    assert.ok(entries.length >= 2, '至少 2 条审计')
+    for (const e of entries) {
+      assert.equal(typeof e.at, 'number')
+      assert.equal(typeof e.tag, 'string')
+      assert.equal(typeof e.type, 'string')
+    }
   } finally {
     await rm(dir, { recursive: true, force: true })
     await rm(root, { recursive: true, force: true })

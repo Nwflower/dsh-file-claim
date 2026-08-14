@@ -25,10 +25,11 @@
 //   node claim.mjs release [<path>... | --all]
 //   node claim.mjs status | who <path>...
 //   node claim.mjs prune | drop <tag> [--force]
+//   node claim.mjs audit [n]                       # 查看最近 n 条操作审计（默认 10）
 //   node claim.mjs pending <path> <内容文件|-表示stdin>   # 写入待合并区
 //   node claim.mjs pending list | show <path> | apply <path> | drop <path>
 
-import { open, readFile, rename, stat, unlink, writeFile, mkdir, copyFile, readdir } from 'node:fs/promises'
+import { open, readFile, rename, stat, unlink, writeFile, mkdir, copyFile, readdir, appendFile } from 'node:fs/promises'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { join, relative, resolve, sep } from 'node:path'
@@ -105,6 +106,48 @@ export async function saveRegistry(stateDir, reg) {
   const tmp = join(stateDir, 'registry.json.tmp')
   await writeFile(tmp, JSON.stringify(reg, null, 2) + '\n', 'utf8')
   await rename(tmp, join(stateDir, 'registry.json'))
+}
+
+// ---------- 操作审计（audit.jsonl，append 一行一个事件） ----------
+//
+// 记录业务变更（claim/release/接管/pending 写·apply·drop/prune/drop），供追溯与
+// 崩溃后核对。心跳（sync）不记——避免噪音。审计是附加记录，不参与协议语义；
+// 写入失败不阻断操作（append 单行原子，失败只会丢这一条）。
+
+export async function appendAudit(stateDir, entry) {
+  try {
+    await appendFile(join(stateDir, 'audit.jsonl'), JSON.stringify(entry) + '\n', 'utf8')
+    return null
+  } catch (e) {
+    return '审计写入失败（不影响操作）：' + (e && e.message ? e.message : String(e))
+  }
+}
+
+// 读最近 count 条审计（倒序，最新在前）；文件不存在返回 []。
+export async function readAudit(stateDir, count = 10) {
+  try {
+    const raw = await readFile(join(stateDir, 'audit.jsonl'), 'utf8')
+    const all = raw
+      .split('\n')
+      .filter(Boolean)
+      .map((l) => {
+        try {
+          return JSON.parse(l)
+        } catch {
+          return null
+        }
+      })
+      .filter(Boolean)
+    return all.slice(-count).reverse()
+  } catch {
+    return []
+  }
+}
+
+function fmtAuditEntry(e) {
+  const who = e.tag ? ' ' + e.tag : ''
+  const what = e.paths && e.paths.length ? ' ' + e.paths.join(', ') : e.path ? ' ' + e.path : ''
+  return '  ' + fmtTime(e.at) + who + ' ' + e.type + what + (e.detail ? '（' + e.detail + '）' : '')
 }
 
 // ---------- 互斥锁（'wx' 独占创建，跨进程原子） ----------
@@ -202,7 +245,20 @@ async function cmdStatus(ctx) {
     lines.push('待合并区（' + pending.length + ' 项，用 pending apply/show/drop 处理）：')
     for (const p of pending) lines.push('  - ' + fmtPendingMeta(p.rel, p.meta))
   }
+  const recent = await readAudit(ctx.stateDir, 3)
+  if (recent.length > 0) {
+    lines.push('')
+    lines.push('最近审计（audit [n] 查看全部）：')
+    for (const e of recent) lines.push(fmtAuditEntry(e))
+  }
   return { code: 0, lines }
+}
+
+async function cmdAudit(ctx, countArg) {
+  const n = countArg ? Math.min(50, Math.max(1, Number(countArg) || 10)) : 10
+  const entries = await readAudit(ctx.stateDir, n)
+  if (entries.length === 0) return { code: 0, lines: ['暂无审计记录。'] }
+  return { code: 0, lines: ['最近审计（' + entries.length + ' 条）：', ...entries.map(fmtAuditEntry)] }
 }
 
 async function cmdSync(ctx, opts) {
@@ -264,6 +320,14 @@ async function cmdClaim(ctx, opts, paths) {
     reg.sessions[ctx.tag] = mine
     await saveRegistry(ctx.stateDir, reg)
     lines.push('已认领：' + mine.claims.join(', '), '其他会话不得修改这些文件；完成后 release。')
+    const warn = await appendAudit(ctx.stateDir, {
+      at: ctx.now,
+      tag: ctx.tag,
+      type: blockers.length > 0 ? 'takeover' : 'claim',
+      paths: normed,
+      detail: blockers.length > 0 ? '接管 stale: ' + blockers.join('、') : undefined,
+    })
+    if (warn) lines.push('⚠️ ' + warn)
     return { code: 0, lines }
   })
 }
@@ -304,6 +368,8 @@ async function cmdRelease(ctx, opts, paths) {
     // 解锁检查：本次释放的路径（或指向本会话的）有待合并内容 → 提示处理。
     const pendingLines = await pendingUnlockCheck(ctx.stateDir, toRelease, ctx.tag)
     if (pendingLines.length > 0) lines.push('', ...pendingLines)
+    const warn = await appendAudit(ctx.stateDir, { at: ctx.now, tag: ctx.tag, type: 'release', paths: toRelease })
+    if (warn) lines.push('⚠️ ' + warn)
     return { code: 0, lines }
   })
 }
@@ -330,7 +396,12 @@ async function cmdPrune(ctx) {
     const stale = Object.keys(reg.sessions).filter((t) => ctx.now - reg.sessions[t].lastSeenAt > ctx.staleMs)
     for (const t of stale) delete reg.sessions[t]
     await saveRegistry(ctx.stateDir, reg)
-    return { code: 0, lines: [stale.length ? '已清理 stale 会话：' + stale.join('、') : '没有 stale 会话。'] }
+    const lines = [stale.length ? '已清理 stale 会话：' + stale.join('、') : '没有 stale 会话。']
+    if (stale.length > 0) {
+      const warn = await appendAudit(ctx.stateDir, { at: ctx.now, tag: ctx.tag, type: 'prune', paths: stale })
+      if (warn) lines.push('⚠️ ' + warn)
+    }
+    return { code: 0, lines }
   })
 }
 
@@ -345,7 +416,8 @@ async function cmdDrop(ctx, opts, target) {
     }
     delete reg.sessions[target]
     await saveRegistry(ctx.stateDir, reg)
-    return { code: 0, lines: ['已移除会话 ' + target + '。'] }
+    const warn = await appendAudit(ctx.stateDir, { at: ctx.now, tag: ctx.tag, type: 'drop', path: target })
+    return { code: 0, lines: warn ? ['已移除会话 ' + target + '。', '⚠️ ' + warn] : ['已移除会话 ' + target + '。'] }
   })
 }
 
@@ -487,7 +559,8 @@ async function cmdPending(ctx, opts, sub, rest) {
         const meta = await loadPendingMeta(ctx.stateDir, n)
         if (!meta) return { code: 1, lines: [n + ' 没有待合并内容。'] }
         await rmSync(join(pendingEntryDir(ctx.stateDir, n)), { recursive: true, force: true })
-        return { code: 0, lines: ['已丢弃待合并内容：' + n + '（来自 ' + meta.pender + '）'] }
+        const warn = await appendAudit(ctx.stateDir, { at: ctx.now, tag: ctx.tag, type: 'pending-drop', path: n })
+        return { code: 0, lines: warn ? ['已丢弃待合并内容：' + n + '（来自 ' + meta.pender + '）', '⚠️ ' + warn] : ['已丢弃待合并内容：' + n + '（来自 ' + meta.pender + '）'] }
       })
     }
 
@@ -535,13 +608,17 @@ async function cmdPending(ctx, opts, sub, rest) {
         if (res.ok) {
           await writeFile(currentPath, res.content, 'utf8')
           await rmSync(dir, { recursive: true, force: true })
-          return { code: 0, lines: ['已合并：' + n + '（三路合并，无冲突，待合并内容已清除）。'] }
+          const warn = await appendAudit(ctx.stateDir, { at: ctx.now, tag: ctx.tag, type: 'pending-apply', path: n, detail: '已合并' })
+          return { code: 0, lines: warn ? ['已合并：' + n + '（三路合并，无冲突，待合并内容已清除）。', '⚠️ ' + warn] : ['已合并：' + n + '（三路合并，无冲突，待合并内容已清除）。'] }
         }
         if (res.conflicts) {
           await writeFile(currentPath, res.content, 'utf8')
+          const warn = await appendAudit(ctx.stateDir, { at: ctx.now, tag: ctx.tag, type: 'pending-apply', path: n, detail: '冲突留标记' })
           return {
             code: 1,
-            lines: ['合并冲突：' + n + ' —— 已写入冲突标记到工作树，请手动解决后执行 pending drop ' + n + ' 清理。'],
+            lines: warn
+              ? ['合并冲突：' + n + ' —— 已写入冲突标记到工作树，请手动解决后执行 pending drop ' + n + ' 清理。', '⚠️ ' + warn]
+              : ['合并冲突：' + n + ' —— 已写入冲突标记到工作树，请手动解决后执行 pending drop ' + n + ' 清理。'],
           }
         }
         return { code: 1, lines: ['合并失败：' + n + ' —— ' + (res.message || '未知错误')] }
@@ -579,12 +656,20 @@ async function cmdPending(ctx, opts, sub, rest) {
     if (base !== null) await writeFile(join(dir, 'base'), base, 'utf8')
     const meta = { pender: ctx.tag, claimedBy: active[0], at: ctx.now, baseSha }
     await writeFile(join(dir, 'meta.json'), JSON.stringify(meta, null, 2) + '\n', 'utf8')
+    const warn = await appendAudit(ctx.stateDir, {
+      at: ctx.now,
+      tag: ctx.tag,
+      type: 'pending-write',
+      path: n,
+      detail: '持有者 ' + active[0] + (baseSha ? '，base ' + baseSha.slice(0, 7) : ''),
+    })
     return {
       code: 0,
       lines: [
         '已写入待合并区：' + n + '（持有者 ' + active[0] + '，' + (baseSha ? 'base ' + baseSha.slice(0, 7) : '无 base') + '）',
         '对方 release（解锁）时会提示；你也可以稍后执行：',
         '  pending apply ' + n + '（三路合并落盘）/ pending show ' + n + ' / pending drop ' + n,
+        ...(warn ? ['⚠️ ' + warn] : []),
       ],
     }
   })
@@ -641,6 +726,7 @@ export async function run(argv, ctx = {}) {
       case 'who': return cmdWho(full, rest)
       case 'prune': return cmdPrune(full)
       case 'drop': return cmdDrop(full, opts, rest[0])
+      case 'audit': return cmdAudit(full, rest[0])
       case 'pending': return cmdPending(full, opts, rest[0], rest.slice(1))
       case undefined: return { code: 1, lines: ['无参数时运行 status。'] }
       default: return { code: 1, lines: ['未知命令：' + cmd] }
