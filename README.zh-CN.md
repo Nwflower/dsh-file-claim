@@ -1,23 +1,34 @@
 # dsh-file-claim
 
-同一工作区**并行 DSH 会话**的文件认领/保护插件。
+[![CI](https://github.com/Nwflower/dsh-file-claim/actions/workflows/ci.yml/badge.svg)](https://github.com/Nwflower/dsh-file-claim/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![GitHub stars](https://img.shields.io/github/stars/Nwflower/dsh-file-claim)](https://github.com/Nwflower/dsh-file-claim/stargazers)
+[![node](https://img.shields.io/badge/node-%3E%3D18-green.svg)](package.json)
 
-> **v0.1.0** —— 首个发布版。DSH Host 插件，把 `dsh-chat-import` 中 `dev/bin/session.mjs`
-> 验证过的协调协议做成原生工具、生命周期事件与写入守卫。
+> **并行写作，永不覆盖。**
+> 同一工作区并行 DeepSeek Harness (DSH) 会话的文件认领/保护插件。
 
-多个 DSH 会话并行操作同一工作区时，目前彼此无感知：两个会话可能覆盖同一文件、崩溃会话留下
-陈旧状态、想改他人已占文件的会话只能干等或赌。`dsh-file-claim` 用认领/心跳/pending 合并协议
-解决：
+多个 DSH 会话并行操作同一工作区时，彼此毫无感知：两个会话可能覆盖同一文件、崩溃会话留下
+陈旧状态、想改他人已占文件的会话只能干等或赌。`dsh-file-claim` 把一套久经验证的协调协议做成
+原生 DSH 工具、生命周期事件与写入守卫——让并行 Agent 协作而非互相踩踏。
+
+## ✨ 特性
 
 - **claim / release** —— 会话在编辑前声明对文件路径的独占认领。
 - **心跳 + stale 接管** —— 心跳自动刷新；崩溃会话的认领过期（默认 2h）后可用 `--force` 接管。
 - **异步 pending 合并区** —— 不阻塞：会话把「改好的新内容 + git HEAD base」写入待合并区；
   持有者 release 后 `pending apply` 做 **git 三路合并**（current × base × pending），无冲突自动落盘。
-- **拦截** —— 模型可见工具 + `tools/pre-execute` 守卫：拒绝写他人活跃认领文件的工具调用
-  （协作式、尽力而为——shell 写入无法完全拦截）。
+- **写入守卫** —— `tools/pre-execute` 拒绝写他人活跃认领文件的工具调用（协作式、尽力而为——
+  shell 写入无法完全拦截）。
+- **零自动化负担** —— `agent/created` / `agent/status` 自动刷新心跳，`agent/disposed`
+  自动释放离开会话的全部认领。
+- **纯 Host 插件、零依赖** —— 无 Browser 侧、无构建步骤，只用 `node:` 内置模块。
 
-这是**填补空白而非重复造轮子**：DSH 宿主无内建跨会话文件保护；505 个 `dsh-plugin` topic 仓库
-全量扫描零命中文件认领/协调类插件；pending 合并区在 agent 文件锁品类内独有。
+## 为什么需要它
+
+DSH 宿主无内建跨会话文件保护；505 个 `dsh-plugin` topic 仓库全量扫描**零命中**
+文件认领/协调类插件。pending 合并区——现在写下改动、持有者释放后干净合并——在 agent
+文件锁品类内独有。这是**填补空白而非重复造轮子**。
 
 ## 安装
 
@@ -31,11 +42,24 @@ dsh plugin add dsh-file-claim
 dsh plugin --profile web add -w link:<仓库路径>
 ```
 
-插件是**纯 Host 插件**——无 Browser 侧、无构建步骤。
+## 快速开始
 
-## 用法
+1. **先认领，再落笔。** 要改文件？先调用 `claim_files` 声明独占认领，其他会话就不会碰它。
+2. **放心写。** 自己的认领永不阻塞自己；写入被*其他*活跃会话认领的文件会被拒绝，并附带提示
+   （等待 / 对方 stale 后接管 / 写入 pending）。
+3. **文件被占？别干等——写入 pending。** 用 `pending_write` 把改好的内容（含 git HEAD base）
+   放进待合并区。持有者 `release_files` 后，`pending_apply` 干净三路合并落盘。
+4. **写完释放。** `release_files` 清空认领，并运行解锁检查：指向你的待合并条目会浮出提示。
 
-插件注册 8 个模型可见工具（身份即调用会话，无需 `--as`）：
+```text
+claim_files({ paths: ["README.md", "src/"] })
+write / edit ...
+release_files({ paths: ["README.md"] })
+```
+
+## 工具
+
+8 个模型可见工具（身份即调用会话，无需 `--as`）：
 
 | 工具 | 用途 |
 | --- | --- |
@@ -48,13 +72,7 @@ dsh plugin --profile web add -w link:<仓库路径>
 | `pending_show` | 只读：查看某待合并条目的元信息与内容 |
 | `pending_drop` | 丢弃某待合并条目（不合并） |
 
-生命周期自动化（无需手动心跳）：
-
-- `agent/created` 与 `agent/status` → 自动登记 / 刷新会话心跳。
-- `agent/disposed` → 自动释放离开会话的全部认领。
-- `ctx.timer` 定时器 → 活跃会话的兜底心跳。
-
-### 写入守卫
+## 写入守卫
 
 `tools/pre-execute` 拒绝 `write` / `edit` / `bash` / `pwsh` 调用中目标路径被**其他**活跃会话
 认领的情况。拒绝信息带持有者与建议：等 `release_files`、对方 stale 后 `claim_files(force: true)`
@@ -62,7 +80,7 @@ dsh plugin --profile web add -w link:<仓库路径>
 shell 路径解析（`bash`/`pwsh`）为尽力而为：提取引号字面量与重定向目标；解析不出目标即放行
 （fail-open）。
 
-### 配置
+## 配置
 
 在 bundle（`cordis.patch.yml`）中作为插件 config 传入：
 
@@ -76,11 +94,11 @@ shell 路径解析（`bash`/`pwsh`）为尽力而为：提取引号字面量与�
 认领注册表与待合并区位于 `<工作区根>/<stateDirName>/`——建议加入 `.gitignore`。状态跨重启
 保留；绝不触碰 `.git/`。
 
-## Pending 合并区（公开契约）
+## Pending 合并区
 
 存储布局（`<工作区根>/<stateDirName>/pending/` 下）：
 
-```
+```text
 pending/<relpath>/content     待合并的新文件内容
 pending/<relpath>/base        写入时 git HEAD 版本（合并 base）
 pending/<relpath>/meta.json   { pender, claimedBy, at, baseSha }
@@ -96,7 +114,7 @@ apply 语义（`pending_apply`）：用 `git merge-file` 对 `current × base ×
 
 `release_files` 带解锁检查：指向被释放路径（或释放会话）的待合并条目会出现在释放输出中。
 
-## 拦截边界（依赖前必读）
+## 拦截边界
 
 守卫是**协作式护栏**，不是强制锁：任意 shell 命令（`echo > file`、`git checkout`、脚本）、
 外部编辑器、IDE/git 操作完全绕过工具栈。它把「靠 AGENTS.md 自律」升级为「工具层护栏 +
@@ -110,14 +128,7 @@ npm pack --dry-run
 ```
 
 结构：`claim.mjs` 是零依赖纯逻辑核心（可移植，保留 CLI 入口）；`index.mjs` 是唯一宿主面文件；
-`test/` 覆盖两者。背景见 `dev/REQUIREMENTS.md`（本地、不入库）与评估报告
-`dev/file-protection-plugin-study.md`。
-
-## 设计来源
-
-- 可行性评估：`dev/file-protection-plugin-study.md`（本地；按政策不入库）。
-- 需求文档：`dev/REQUIREMENTS.md`（本地；按政策不入库）。
-- 移植的协议：`dsh-chat-import` 仓库的 `dev/bin/session.mjs`（[Nwflower/dsh-chat-import](https://github.com/Nwflower/dsh-chat-import)）。
+`test/` 覆盖两者。
 
 ## 许可
 
