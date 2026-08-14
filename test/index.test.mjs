@@ -252,6 +252,37 @@ test('拦截回归（bug#extractShellPaths 误报）：引号字面量/只读命
   }
 })
 
+test('guardCommit（opt-in）：git commit 提交他人认领路径 deny；msg 含路径不误报；默认关闭', async () => {
+  const root = await tmpRoot()
+  const a = agent('s-a', root)
+  const b = agent('s-b', root)
+  const next = async () => ({ kind: 'allow' })
+  const setup = (config) => {
+    const { ctx, tools, listeners } = mockCtx()
+    plugin.apply(ctx, config)
+    return { tools, pre: listeners.get('tools/pre-execute')[0] }
+  }
+  const g = (pre, command) => pre({ name: 'bash', arguments: { command }, agent: b }, next)
+  try {
+    // 默认 config：guardCommit 未启用 → git commit 提交被认领路径放行
+    const def = setup({})
+    await def.tools.get('claim_files').execute({ paths: ['README.md'] }, exec(a))
+    assert.equal((await g(def.pre, 'git commit -- README.md')).kind, 'allow')
+
+    // guardCommit:true：显式提交被认领路径 → deny；msg 里的路径字样不误报；未认领/无路径放行
+    const en = setup({ guardCommit: true })
+    await en.tools.get('claim_files').execute({ paths: ['README.md'] }, exec(a))
+    assert.equal((await g(en.pre, 'git commit -- README.md')).kind, 'deny')
+    assert.equal((await g(en.pre, 'git commit README.md')).kind, 'deny') // 老语法
+    assert.equal((await g(en.pre, 'git commit -m "update README.md"')).kind, 'allow') // msg 不误报
+    assert.equal((await g(en.pre, 'git commit -am "update README.md"')).kind, 'allow') // -am 值不误报
+    assert.equal((await g(en.pre, 'git commit -m "x" -- LICENSE')).kind, 'allow') // 未认领
+    assert.equal((await g(en.pre, 'git commit -m "x"')).kind, 'allow') // 无路径 fail-open
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('agent/disposed 自动释放该会话全部认领', async () => {
   const { ctx, tools, listeners } = mockCtx()
   plugin.apply(ctx, {})

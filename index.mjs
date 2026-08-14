@@ -8,7 +8,9 @@
 //   3. 事件挂接：agent/created + agent/status → 自动登记/心跳；agent/disposed →
 //      自动释放该会话全部认领；ctx.timer.interval 兜底心跳；
 //   4. tools/pre-execute 拦截：write/edit/bash/pwsh 目标被**其他活跃**会话认领 →
-//      deny（read 不拦截：读取不构成修改，认领只保护写面）；
+//      deny（read 不拦截：读取不构成修改，认领只保护写面）；bash/pwsh 只识别
+//      重定向目标与显式写命令目标（引号字面量不视为写目标，fail-open）；
+//      guardCommit:true 时额外拦截 `git commit` 显式提交他人认领路径（opt-in）；
 //   5. 注册表持久化：工作区本地文件（<repoRoot>/.dsh-file-claim/registry.json，
 //      原子写 + 互斥锁），由 claim.mjs 纯逻辑承担——零 DSH 依赖、跨重启可恢复；
 //   6. 认领根：当前会话 cwd 经 workspaceRegistry.resolveByPath 解析的工作区，无
@@ -388,6 +390,33 @@ function extractShellWriteTargets(command) {
   return [...out]
 }
 
+// git commit 路径提取（guardCommit opt-in）：`git commit` 中被提交的路径。
+// 只认 `--` 之后的显式路径；-m/--message/-am 等选项跳过其值（防 message 里的路径字样
+// 误报）；无路径（裸 `git commit`）→ 无法确定改动范围 → fail-open。
+function extractGitCommitPaths(command) {
+  const tokens = splitCommandArgs(String(command))
+  const out = []
+  for (let i = 0; i < tokens.length; i++) {
+    if (tokens[i] !== 'git' || tokens[i + 1] !== 'commit') continue
+    let j = i + 2
+    while (j < tokens.length && !CMD_BOUNDARY.test(tokens[j])) {
+      const t = tokens[j]
+      if (t === '--') {
+        for (let k = j + 1; k < tokens.length && !CMD_BOUNDARY.test(tokens[k]); k++) out.push(tokens[k])
+        break
+      }
+      if (t.startsWith('-')) {
+        j += 2 // 跳过选项及其值；无值选项（-a）会跳过真实路径 → fail-open
+        continue
+      }
+      out.push(t) // 老语法：git commit <path>
+      j++
+    }
+    break
+  }
+  return out
+}
+
 function targetsOf(name, args) {
   const a = args || {}
   if (name === 'write' || name === 'edit') {
@@ -407,6 +436,11 @@ async function guardDenyReason(ctx, config, exec) {
   const tag = agentId(agent)
   if (!tag) return null
   const targets = targetsOf(name, exec.arguments)
+  // commit 级守卫（opt-in）：git commit 显式提交他人认领路径 → 一并检查
+  if (config.guardCommit === true && (name === 'bash' || name === 'pwsh')) {
+    const cmd = exec.arguments && typeof exec.arguments.command === 'string' ? exec.arguments.command : ''
+    targets.push(...extractGitCommitPaths(cmd))
+  }
   if (targets.length === 0) return null // 解析不出目标 → 放行
   const cwd = agent && agent.session && agent.session.header ? agent.session.header.cwd : undefined
   if (!cwd) return null
@@ -459,6 +493,7 @@ export default {
       staleMs: DEFAULT_STALE_MS,
       stateDirName: DEFAULT_STATE_DIR,
       guard: true,
+      guardCommit: false,
       heartbeatMs: DEFAULT_HEARTBEAT_MS,
       ...config,
     }
