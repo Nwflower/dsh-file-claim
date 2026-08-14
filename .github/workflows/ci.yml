@@ -15,6 +15,10 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci --no-audit --no-fund
+      # lockfile 漂移护栏：npm ci 必须严格复现 package-lock.json
+      - run: git diff --exit-code -- package-lock.json
       - run: npm test
+      # 双语 README 结构同步（REQ-05）
+      - run: node .github/scripts/check-readme-sync.mjs
       # 发布面回归护栏：files 白名单缺文件/拼错会在 pack 时失败
       - run: npm pack --dry-run
