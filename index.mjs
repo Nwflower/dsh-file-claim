@@ -483,6 +483,17 @@ async function autoRun(ctx, config, agent, argv) {
   }
 }
 
+// prune 不需要会话身份（全局清理该工作区 stale 会话），与 autoRun 分开；失败静默。
+async function autoPrune(ctx, config, agent) {
+  try {
+    const base = await claimCtx(ctx, config, agent)
+    if (!base) return
+    await run(['prune'], { ...base, env: { ...base.env } })
+  } catch {
+    // 自动动作失败不阻断宿主（下次心跳重试）
+  }
+}
+
 // ---------- 插件入口 ----------
 
 export default {
@@ -515,14 +526,18 @@ export default {
       void autoRun(ctx, cfg, agent, ['release', '--all'])
     })
 
-    // 兜底心跳：agent/status 事件之外，定期刷新所有活跃会话心跳
+    // 兜底心跳：agent/status 事件之外，定期刷新所有活跃会话心跳，并顺带清理 stale 会话
+    // （registry.json 不因带 note 的残留会话无限增长——心跳停止 2h 后自动 prune）。
     const timer = ctx.get('timer')
     if (timer && typeof timer.interval === 'function') {
       ctx.effect(() =>
         timer.interval(() => {
           const agents = ctx.get('agents')
           if (!agents || typeof agents.list !== 'function') return
-          for (const a of agents.list()) void autoRun(ctx, cfg, a, ['sync'])
+          for (const a of agents.list()) {
+            void autoRun(ctx, cfg, a, ['sync'])
+            void autoPrune(ctx, cfg, a)
+          }
         }, cfg.heartbeatMs),
       )
     }

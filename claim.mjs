@@ -113,10 +113,25 @@ export async function saveRegistry(stateDir, reg) {
 // 记录业务变更（claim/release/接管/pending 写·apply·drop/prune/drop），供追溯与
 // 崩溃后核对。心跳（sync）不记——避免噪音。审计是附加记录，不参与协议语义；
 // 写入失败不阻断操作（append 单行原子，失败只会丢这一条）。
+// 文件超过 auditMaxBytes（默认 1MB）时轮转：保留最近一半条目 + 新条目，防止无限增长
+// （调用方持有独占锁，读-截断-写安全）。
 
-export async function appendAudit(stateDir, entry) {
+const DEFAULT_AUDIT_MAX_BYTES = 1024 * 1024
+
+export async function appendAudit(ctx, entry) {
   try {
-    await appendFile(join(stateDir, 'audit.jsonl'), JSON.stringify(entry) + '\n', 'utf8')
+    const file = join(ctx.stateDir, 'audit.jsonl')
+    const st = await stat(file).catch(() => null)
+    if (st && st.size > (ctx.auditMaxBytes || DEFAULT_AUDIT_MAX_BYTES)) {
+      const raw = await readFile(file, 'utf8')
+      const lines = raw.split('\n').filter(Boolean)
+      const keep = lines.slice(-Math.max(1, Math.floor(lines.length / 2)))
+      const tmp = file + '.tmp'
+      await writeFile(tmp, keep.join('\n') + '\n' + JSON.stringify(entry) + '\n', 'utf8')
+      await rename(tmp, file)
+      return null
+    }
+    await appendFile(file, JSON.stringify(entry) + '\n', 'utf8')
     return null
   } catch (e) {
     return '审计写入失败（不影响操作）：' + (e && e.message ? e.message : String(e))
@@ -320,7 +335,7 @@ async function cmdClaim(ctx, opts, paths) {
     reg.sessions[ctx.tag] = mine
     await saveRegistry(ctx.stateDir, reg)
     lines.push('已认领：' + mine.claims.join(', '), '其他会话不得修改这些文件；完成后 release。')
-    const warn = await appendAudit(ctx.stateDir, {
+    const warn = await appendAudit(ctx, {
       at: ctx.now,
       tag: ctx.tag,
       type: blockers.length > 0 ? 'takeover' : 'claim',
@@ -368,7 +383,7 @@ async function cmdRelease(ctx, opts, paths) {
     // 解锁检查：本次释放的路径（或指向本会话的）有待合并内容 → 自动尝试无冲突合并并提示。
     const pendingLines = await pendingUnlockCheck(ctx, toRelease, ctx.tag)
     if (pendingLines.length > 0) lines.push('', ...pendingLines)
-    const warn = await appendAudit(ctx.stateDir, { at: ctx.now, tag: ctx.tag, type: 'release', paths: toRelease })
+    const warn = await appendAudit(ctx, { at: ctx.now, tag: ctx.tag, type: 'release', paths: toRelease })
     if (warn) lines.push('⚠️ ' + warn)
     return { code: 0, lines }
   })
@@ -398,7 +413,7 @@ async function cmdPrune(ctx) {
     await saveRegistry(ctx.stateDir, reg)
     const lines = [stale.length ? '已清理 stale 会话：' + stale.join('、') : '没有 stale 会话。']
     if (stale.length > 0) {
-      const warn = await appendAudit(ctx.stateDir, { at: ctx.now, tag: ctx.tag, type: 'prune', paths: stale })
+      const warn = await appendAudit(ctx, { at: ctx.now, tag: ctx.tag, type: 'prune', paths: stale })
       if (warn) lines.push('⚠️ ' + warn)
     }
     return { code: 0, lines }
@@ -416,7 +431,7 @@ async function cmdDrop(ctx, opts, target) {
     }
     delete reg.sessions[target]
     await saveRegistry(ctx.stateDir, reg)
-    const warn = await appendAudit(ctx.stateDir, { at: ctx.now, tag: ctx.tag, type: 'drop', path: target })
+    const warn = await appendAudit(ctx, { at: ctx.now, tag: ctx.tag, type: 'drop', path: target })
     return { code: 0, lines: warn ? ['已移除会话 ' + target + '。', '⚠️ ' + warn] : ['已移除会话 ' + target + '。'] }
   })
 }
@@ -492,7 +507,7 @@ async function pendingUnlockCheck(ctx, released, releasedBy) {
   for (const p of hits) {
     const r = await mergePendingEntry(ctx, p.rel)
     if (r.ok) {
-      const warn = await appendAudit(ctx.stateDir, {
+      const warn = await appendAudit(ctx, {
         at: ctx.now,
         tag: ctx.tag,
         type: 'pending-apply',
@@ -638,7 +653,7 @@ async function cmdPending(ctx, opts, sub, rest) {
         const meta = await loadPendingMeta(ctx.stateDir, n)
         if (!meta) return { code: 1, lines: [n + ' 没有待合并内容。'] }
         await rmSync(join(pendingEntryDir(ctx.stateDir, n)), { recursive: true, force: true })
-        const warn = await appendAudit(ctx.stateDir, { at: ctx.now, tag: ctx.tag, type: 'pending-drop', path: n })
+        const warn = await appendAudit(ctx, { at: ctx.now, tag: ctx.tag, type: 'pending-drop', path: n })
         return { code: 0, lines: warn ? ['已丢弃待合并内容：' + n + '（来自 ' + meta.pender + '）', '⚠️ ' + warn] : ['已丢弃待合并内容：' + n + '（来自 ' + meta.pender + '）'] }
       })
     }
@@ -647,7 +662,7 @@ async function cmdPending(ctx, opts, sub, rest) {
     return withLock(ctx.stateDir, async () => {
       const r = await mergePendingEntry(ctx, n)
       if (r.ok) {
-        const warn = await appendAudit(ctx.stateDir, { at: ctx.now, tag: ctx.tag, type: 'pending-apply', path: n, detail: '已合并' })
+        const warn = await appendAudit(ctx, { at: ctx.now, tag: ctx.tag, type: 'pending-apply', path: n, detail: '已合并' })
         return { code: 0, lines: warn ? ['已合并：' + n + '（三路合并，无冲突，待合并内容已清除）。', '⚠️ ' + warn] : ['已合并：' + n + '（三路合并，无冲突，待合并内容已清除）。'] }
       }
       if (r.reason === 'no-entry') return { code: 1, lines: [n + ' 没有待合并内容。'] }
@@ -657,7 +672,7 @@ async function cmdPending(ctx, opts, sub, rest) {
         return { code: 1, lines: [n + ' 缺少 base（写入时无 git HEAD 版本），无法自动合并——请 pending show 查看后手动处理，或 pending drop 丢弃。'] }
       }
       if (r.reason === 'conflicts') {
-        const warn = await appendAudit(ctx.stateDir, { at: ctx.now, tag: ctx.tag, type: 'pending-apply', path: n, detail: '冲突留标记' })
+        const warn = await appendAudit(ctx, { at: ctx.now, tag: ctx.tag, type: 'pending-apply', path: n, detail: '冲突留标记' })
         return {
           code: 1,
           lines: warn
@@ -697,7 +712,7 @@ async function cmdPending(ctx, opts, sub, rest) {
     if (base !== null) await writeFile(join(dir, 'base'), base, 'utf8')
     const meta = { pender: ctx.tag, claimedBy: active[0], at: ctx.now, baseSha }
     await writeFile(join(dir, 'meta.json'), JSON.stringify(meta, null, 2) + '\n', 'utf8')
-    const warn = await appendAudit(ctx.stateDir, {
+    const warn = await appendAudit(ctx, {
       at: ctx.now,
       tag: ctx.tag,
       type: 'pending-write',
@@ -748,6 +763,7 @@ export async function run(argv, ctx = {}) {
     now: ctx.now || Date.now(),
     env,
     staleMs: ctx.staleMs || staleMsOf(env),
+    auditMaxBytes: ctx.auditMaxBytes,
   }
   const { opts, positional } = parseArgs(argv)
   const cmd = positional[0]

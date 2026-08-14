@@ -16,6 +16,8 @@ function mockCtx() {
   const commands = new Map()
   const listeners = new Map()
   const disposers = []
+  const agents = []
+  let intervalCb = null
   const ctx = {
     get(name) {
       return ctx[name]
@@ -54,10 +56,28 @@ function mockCtx() {
         return commands.get(name)
       },
     },
-    timer: { interval: () => () => {} },
+    timer: {
+      interval(cb) {
+        intervalCb = cb
+        return () => {
+          intervalCb = null
+        }
+      },
+    },
+    agents: { list: () => agents },
     workspaceRegistry: { resolveByPath: async () => undefined },
   }
-  return { ctx, tools, commands, listeners, disposers }
+  return {
+    ctx,
+    tools,
+    commands,
+    listeners,
+    disposers,
+    agents,
+    async runInterval() {
+      if (intervalCb) await intervalCb()
+    },
+  }
 }
 
 function agent(id, cwd) {
@@ -278,6 +298,34 @@ test('guardCommit（opt-in）：git commit 提交他人认领路径 deny；msg �
     assert.equal((await g(en.pre, 'git commit -am "update README.md"')).kind, 'allow') // -am 值不误报
     assert.equal((await g(en.pre, 'git commit -m "x" -- LICENSE')).kind, 'allow') // 未认领
     assert.equal((await g(en.pre, 'git commit -m "x"')).kind, 'allow') // 无路径 fail-open
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('心跳间隔自动清理 stale 会话（registry 不因残留会话无限增长）', async () => {
+  const { ctx, tools, agents, runInterval } = mockCtx()
+  plugin.apply(ctx, { staleMs: 500 })
+  const root = await tmpRoot()
+  const gone = agent('s-gone', root)
+  const here = agent('s-here', root)
+  agents.push(gone, here)
+  try {
+    // 带 note 的会话（release 后记录会保留）——必须能被自动 prune 清掉
+    await tools.get('claim_files').execute({ paths: ['README.md'], note: '残留备注' }, exec(gone))
+    await tools.get('claim_files').execute({ paths: ['LICENSE'] }, exec(here))
+    // 模拟 s-gone 会话离开：从 agents 移除 → 心跳停止 → staleMs 后变 stale
+    agents.splice(agents.indexOf(gone), 1)
+    await new Promise((r) => setTimeout(r, 700))
+    await runInterval()
+    // s-gone 被自动 prune 清理；s-here 保留
+    await waitFor(async () => {
+      const reg = JSON.parse(await readFile(join(root, '.dsh-file-claim', 'registry.json'), 'utf8'))
+      return !reg.sessions['s-gone']
+    })
+    const reg = JSON.parse(await readFile(join(root, '.dsh-file-claim', 'registry.json'), 'utf8'))
+    assert.equal(reg.sessions['s-gone'], undefined)
+    assert.ok(reg.sessions['s-here'])
   } finally {
     await rm(root, { recursive: true, force: true })
   }

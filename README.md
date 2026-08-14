@@ -217,7 +217,8 @@ appended as one JSON line to `<stateDir>/audit.jsonl` (`{ at, tag, type, paths/p
 for traceability and post-crash reconciliation. Heartbeats are intentionally **not** logged (noise).
 `node claim.mjs audit [n]` prints the latest `n` entries (default 10); `claim_status` always shows
 the three most recent. Audit writes are append-only and never block or alter claim semantics; a
-failed audit append surfaces a warning line without failing the operation.
+failed audit append surfaces a warning line without failing the operation. The file self-rotates
+at 1 MB (keeping the most recent half plus the new entry), so it never grows without bound.
 
 ## Pending Merge Area
 
@@ -275,6 +276,10 @@ presentation/restrictions (like every plugin tool). The plugin registers globall
 **What if a pending entry can't merge?** It stays pending with the reason surfaced (still occupied,
 missing base, conflicts, missing file). Use `pending_show` to inspect and `pending_apply` /
 `pending_drop` to resolve — nothing is ever blindly merged.
+
+**Do the registry and audit files grow forever?** No. Stale sessions are pruned automatically on
+the heartbeat interval (so departed sessions' records don't accumulate), and `audit.jsonl`
+self-rotates at 1 MB. Both stay bounded in normal use.
 
 ## Development
 

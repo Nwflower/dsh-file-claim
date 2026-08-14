@@ -370,3 +370,25 @@ test('audit：claim/release 操作写入 audit.jsonl；audit 命令与 status �
     await rm(root, { recursive: true, force: true })
   }
 })
+
+test('audit 超限自动轮转（audit.jsonl 不无限增长，保留最近条目）', async () => {
+  const dir = await tmpState()
+  const root = await tmpState()
+  try {
+    // auditMaxBytes 极小 → 每次追加都触发轮转（保留最近一半 + 新条目）
+    for (let i = 0; i < 5; i++) {
+      await run(['claim', '--as', 's-' + i, 'README.md'], { stateDir: dir, repoRoot: root, auditMaxBytes: 120 })
+      await run(['release', '--as', 's-' + i, '--all'], { stateDir: dir, repoRoot: root, auditMaxBytes: 120 })
+    }
+    const raw = await readFile(join(dir, 'audit.jsonl'), 'utf8')
+    const lines = raw.split('\n').filter(Boolean)
+    // 10 次事件后仍保持小体积（远小于 10 条），且可正常读取
+    assert.ok(lines.length <= 6, '轮转后条目受限，实际 ' + lines.length)
+    const au = await run(['audit'], { stateDir: dir, repoRoot: root })
+    expect(au, 0, '最近审计')
+    for (const l of lines) JSON.parse(l) // 轮转后仍是合法 JSON 行
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+    await rm(root, { recursive: true, force: true })
+  }
+})

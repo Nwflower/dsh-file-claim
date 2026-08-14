@@ -205,7 +205,7 @@ shell 路径解析（`bash`/`pwsh`）为尽力而为：只提取**重定向目�
 追加到 `<stateDir>/audit.jsonl`（`{ at, tag, type, paths/path, detail }`），供追溯与崩溃后核对。
 心跳**刻意不记**（避免噪音）。`node claim.mjs audit [n]` 打印最近 `n` 条（默认 10）；
 `claim_status` 恒显示最近 3 条。审计只追加、不参与也不改变认领语义；审计写入失败只会提示
-警告行，不阻断操作。
+警告行，不阻断操作。文件超过 1MB 自动轮转（保留最近一半 + 新条目），不会无限增长。
 
 ## Pending 合并区
 
@@ -255,6 +255,9 @@ stale 接管只是最后的兜底。
 
 **pending 条目无法合并怎么办？** 条目保留并附原因（仍被占用 / 缺 base / 冲突 / 文件缺失）。
 用 `pending_show` 查看、`pending_apply` / `pending_drop` 处理——绝不盲合。
+
+**registry 与审计文件会无限增长吗？** 不会。stale 会话在心跳间隔被**自动清理**（离开会话的
+记录不会累积）；`audit.jsonl` 超 1MB 自动轮转。两者在正常使用下都保持有界。
 
 ## 开发
 
