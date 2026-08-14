@@ -6,6 +6,9 @@
 # 本地工程面 —— 整个目录不入库
 dev/
 
+# dsh-file-claim 运行时状态目录（注册表 + pending 待合并区；README 建议忽略）
+.dsh-file-claim/
+
 # 本地测试依赖
 node_modules/
 
