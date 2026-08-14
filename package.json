@@ -6,11 +6,13 @@
   "main": "./index.mjs",
   "exports": {
     ".": "./index.mjs",
+    "./claim.mjs": "./claim.mjs",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
   "files": [
     "index.mjs",
+    "claim.mjs",
     "cordis.patch.yml",
     "README.md",
     "README.zh-CN.md",
