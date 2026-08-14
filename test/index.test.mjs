@@ -305,7 +305,8 @@ test('guardCommit（opt-in）：git commit 提交他人认领路径 deny；msg �
 
 test('心跳间隔自动清理 stale 会话（registry 不因残留会话无限增长）', async () => {
   const { ctx, tools, agents, runInterval } = mockCtx()
-  plugin.apply(ctx, { staleMs: 500 })
+  // 真实时间测试：staleMs 300 vs sleep 1200，留足余量避免时钟抖动导致偶发失败
+  plugin.apply(ctx, { staleMs: 300 })
   const root = await tmpRoot()
   const gone = agent('s-gone', root)
   const here = agent('s-here', root)
@@ -316,7 +317,7 @@ test('心跳间隔自动清理 stale 会话（registry 不因残留会话无限�
     await tools.get('claim_files').execute({ paths: ['LICENSE'] }, exec(here))
     // 模拟 s-gone 会话离开：从 agents 移除 → 心跳停止 → staleMs 后变 stale
     agents.splice(agents.indexOf(gone), 1)
-    await new Promise((r) => setTimeout(r, 700))
+    await new Promise((r) => setTimeout(r, 1200))
     await runInterval()
     // s-gone 被自动 prune 清理；s-here 保留
     await waitFor(async () => {
