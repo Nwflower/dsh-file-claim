@@ -22,8 +22,9 @@ so parallel agents cooperate instead of clobbering each other.
 - **heartbeat + stale takeover** — sessions refresh a heartbeat automatically; a crashed session's
   claims expire (default 2h) and can be taken over with `--force`.
 - **async pending merge area** — instead of blocking, a session writes its edited content plus the
-  git HEAD base into a pending area; after the owner releases, `pending apply` performs a
-  **git 3-way merge** (`current × base × pending`), auto-committing when conflict-free.
+  git HEAD base into a pending area; when the owner releases, the entry is **auto-merged** via a
+  **git 3-way merge** (`current × base × pending`) when conflict-free, or applied manually with
+  `pending apply` when it conflicts.
 - **write guard** — a `tools/pre-execute` guard refuses writes to files actively claimed by
   another session (advisory, cooperative — shell writes cannot be fully intercepted).
 - **zero automation burden** — `agent/created` / `agent/status` refresh the heartbeat, and
@@ -68,8 +69,8 @@ dsh plugin --profile web add -w link:<repo-path>
 2. **Write freely.** Your own claims never block you; writes to files actively claimed by
    *another* session are denied with a hint (wait / takeover when stale / pending).
 3. **Busy file? Don't wait — pend.** Use `pending_write` to drop your edited content into the
-   pending area (with the git HEAD base). Once the owner calls `release_files`, run `pending_apply`
-   for a clean 3-way merge.
+   pending area (with the git HEAD base). Once the owner calls `release_files`, the entry is
+   auto-merged when conflict-free — or run `pending_apply` manually for a clean 3-way merge.
 4. **Release when done.** `release_files` clears your claims and runs an unlock check that
    surfaces any pending entries waiting on you.
 
@@ -169,7 +170,10 @@ entry is **kept** for manual resolution. Missing base → refused, never a blind
 by any session → refused until released.
 
 `release_files` runs an unlock check: pending entries aimed at the released paths (or at the
-releasing session) are surfaced in the release output.
+releasing session) are **auto-merged** when the 3-way merge is conflict-free (content lands on
+disk, entry cleared); entries that cannot merge — still occupied, missing base, conflicts, or
+missing file — stay pending and are surfaced with manual `pending_apply` / `pending_show` /
+`pending_drop` hints.
 
 ## Enforcement Boundary
 

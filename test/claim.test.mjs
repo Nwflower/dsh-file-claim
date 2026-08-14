@@ -5,6 +5,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtemp, rm, readFile, writeFile } from 'node:fs/promises'
+import { execSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { run } from '../claim.mjs'
@@ -233,6 +234,35 @@ test('release 解锁时检查待合并区并提示待合并内容', async () => 
     // status 也展示待合并区
     const st = await run(['status'], { stateDir: dir, repoRoot: root })
     expect(st, 0, '待合并区', 'README.md')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('release 自动合并：pending 无冲突时自动三路合并落盘并清除条目', async () => {
+  const dir = await tmpState()
+  const root = await tmpState()
+  try {
+    execSync('git init -q', { cwd: root })
+    execSync('git config user.email t@test && git config user.name t', { cwd: root })
+    await writeFile(join(root, 'README.md'), 'v1\n', 'utf8')
+    execSync('git add README.md && git commit -qm init', { cwd: root })
+    await run(['claim', '--as', 's-a', 'README.md'], { stateDir: dir, repoRoot: root })
+    await writeFile(join(root, 'pending-content.txt'), 'v2\n', 'utf8')
+    const pw = await run(['pending', 'README.md', 'pending-content.txt'], {
+      stateDir: dir,
+      repoRoot: root,
+      env: { ...env, DSH_SESSION_ID: 's-b' },
+    })
+    expect(pw, 0, '已写入待合并区', 'base')
+    // A release → 解锁检查自动合并（current v1 × base v1 × pending v2 → v2 无冲突）
+    const rel = await run(['release', '--as', 's-a', '--all'], { stateDir: dir, repoRoot: root })
+    expect(rel, 0, '已自动三路合并落盘', 'README.md')
+    assert.equal(await readFile(join(root, 'README.md'), 'utf8'), 'v2\n')
+    // 条目已清除
+    const list = await run(['pending', 'list'], { stateDir: dir, repoRoot: root })
+    expect(list, 0, '待合并区为空')
   } finally {
     await rm(dir, { recursive: true, force: true })
     await rm(root, { recursive: true, force: true })

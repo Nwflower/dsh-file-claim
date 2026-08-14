@@ -365,8 +365,8 @@ async function cmdRelease(ctx, opts, paths) {
       '已释放：' + (toRelease.length ? toRelease.join(', ') : '（无匹配认领）'),
       mine.claims.length ? '剩余认领：' + mine.claims.join(', ') : '认领已清空。',
     ]
-    // 解锁检查：本次释放的路径（或指向本会话的）有待合并内容 → 提示处理。
-    const pendingLines = await pendingUnlockCheck(ctx.stateDir, toRelease, ctx.tag)
+    // 解锁检查：本次释放的路径（或指向本会话的）有待合并内容 → 自动尝试无冲突合并并提示。
+    const pendingLines = await pendingUnlockCheck(ctx, toRelease, ctx.tag)
     if (pendingLines.length > 0) lines.push('', ...pendingLines)
     const warn = await appendAudit(ctx.stateDir, { at: ctx.now, tag: ctx.tag, type: 'release', paths: toRelease })
     if (warn) lines.push('⚠️ ' + warn)
@@ -480,19 +480,98 @@ function fmtPendingMeta(rel, meta) {
   return rel + '（来自 ' + meta.pender + '，写入 ' + fmtTime(meta.at) + (meta.baseSha ? '，base ' + meta.baseSha.slice(0, 7) : '') + '）'
 }
 
-// 解锁检查：release 后调用，报告需要新合并的 pending 内容。
-async function pendingUnlockCheck(stateDir, released, releasedBy) {
-  const all = await listPendingEntries(stateDir)
+// 解锁检查：release 后调用。对被释放路径（或指向释放会话）的 pending 条目**自动尝试**
+// 无冲突三路合并：成功落盘并清除；失败（占用/缺 base/冲突/文件缺失）保留并提示手动。
+async function pendingUnlockCheck(ctx, released, releasedBy) {
+  const all = await listPendingEntries(ctx.stateDir)
   const hits = all.filter(
     (p) => p.meta.claimedBy === releasedBy || released.some((r) => p.rel === r || p.rel.startsWith(r + '/')),
   )
   if (hits.length === 0) return []
-  const lines = ['⚠️ 解锁检查：以下待合并内容需要处理 ——']
+  const lines = ['⚠️ 解锁检查：以下待合并内容已处理 ——']
   for (const p of hits) {
-    lines.push('  - ' + fmtPendingMeta(p.rel, p.meta))
-    lines.push('    → pending apply ' + p.rel + '（三路合并）/ pending show ' + p.rel + ' / pending drop ' + p.rel)
+    const r = await mergePendingEntry(ctx, p.rel)
+    if (r.ok) {
+      const warn = await appendAudit(ctx.stateDir, {
+        at: ctx.now,
+        tag: ctx.tag,
+        type: 'pending-apply',
+        path: p.rel,
+        detail: 'release 自动合并',
+      })
+      lines.push('  - ' + p.rel + '：已自动三路合并落盘（来自 ' + p.meta.pender + '）' + (warn ? '（⚠️ ' + warn + '）' : ''))
+    } else {
+      const why =
+        r.reason === 'conflicts'
+          ? '合并冲突（已写冲突标记）'
+          : r.reason === 'no-base'
+            ? '缺 base'
+            : r.reason === 'no-file'
+              ? '当前文件不存在'
+              : r.reason === 'occupied'
+                ? '仍被占用（' + r.detail + '）'
+                : r.reason === 'merge-failed'
+                  ? '合并失败：' + r.detail
+                  : '条目不存在'
+      lines.push('  - ' + fmtPendingMeta(p.rel, p.meta) + '：自动合并未执行（' + why + '）')
+      lines.push('    → pending apply ' + p.rel + ' / pending show ' + p.rel + ' / pending drop ' + p.rel)
+    }
   }
   return lines
+}
+
+// 对单个 pending 条目执行三路合并（须在 withLock 内调用）。返回：
+//   { ok: true }                已合并落盘、条目清除（无冲突）
+//   { ok: false, reason, detail? }  未完成合并（条目保留）
+// reason: 'no-entry' | 'occupied' | 'no-file' | 'no-base' | 'conflicts'（已写冲突标记）| 'merge-failed'
+async function mergePendingEntry(ctx, n) {
+  const meta = await loadPendingMeta(ctx.stateDir, n)
+  if (!meta) return { ok: false, reason: 'no-entry' }
+  const reg = await loadRegistry(ctx.stateDir)
+  const holders = Object.keys(reg.sessions).filter((t) => pathConflict(reg.sessions[t].claims, [n]))
+  const active = holders.filter((t) => ctx.now - reg.sessions[t].lastSeenAt <= ctx.staleMs)
+  if (active.length > 0) return { ok: false, reason: 'occupied', detail: active.join('、') }
+  const dir = pendingEntryDir(ctx.stateDir, n)
+  const currentPath = join(ctx.repoRoot, n)
+  let current
+  try {
+    current = await readFile(currentPath, 'utf8')
+  } catch (e) {
+    return { ok: false, reason: 'no-file', detail: e.code }
+  }
+  let base
+  try {
+    base = await readFile(join(dir, 'base'), 'utf8')
+  } catch {
+    base = null
+  }
+  if (base === null) return { ok: false, reason: 'no-base' }
+  const other = await readFile(join(dir, 'content'), 'utf8')
+  const merge = ctx.mergeFile || gitMergeFile
+  // 三路合并需要真实文件路径；把 current/base/other 落到临时文件再调 merge。
+  const tmp = join(tmpdir(), 'dsh-apply-' + randomBytes(4).toString('hex'))
+  await mkdir(tmp, { recursive: true })
+  try {
+    const curF = join(tmp, 'current')
+    const baseF = join(tmp, 'base')
+    const otherF = join(tmp, 'other')
+    await writeFile(curF, current, 'utf8')
+    await writeFile(baseF, base, 'utf8')
+    await writeFile(otherF, other, 'utf8')
+    const res = await merge(curF, baseF, otherF)
+    if (res.ok) {
+      await writeFile(currentPath, res.content, 'utf8')
+      await rmSync(dir, { recursive: true, force: true })
+      return { ok: true }
+    }
+    if (res.conflicts) {
+      await writeFile(currentPath, res.content, 'utf8')
+      return { ok: false, reason: 'conflicts' }
+    }
+    return { ok: false, reason: 'merge-failed', detail: res.message || '未知错误' }
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
 }
 
 // git 三路合并（默认实现，可被 ctx.mergeFile 注入替换以便测试）。
@@ -566,65 +645,27 @@ async function cmdPending(ctx, opts, sub, rest) {
 
     // apply：三路合并
     return withLock(ctx.stateDir, async () => {
-      const meta = await loadPendingMeta(ctx.stateDir, n)
-      if (!meta) return { code: 1, lines: [n + ' 没有待合并内容。'] }
-      const reg = await loadRegistry(ctx.stateDir)
-      const holders = Object.keys(reg.sessions).filter((t) => pathConflict(reg.sessions[t].claims, [n]))
-      const active = holders.filter((t) => ctx.now - reg.sessions[t].lastSeenAt <= ctx.staleMs)
-      if (active.length > 0) {
-        return { code: 1, lines: [n + ' 仍被活跃会话占用（' + active.join('、') + '），先等其 release 再合并。'] }
+      const r = await mergePendingEntry(ctx, n)
+      if (r.ok) {
+        const warn = await appendAudit(ctx.stateDir, { at: ctx.now, tag: ctx.tag, type: 'pending-apply', path: n, detail: '已合并' })
+        return { code: 0, lines: warn ? ['已合并：' + n + '（三路合并，无冲突，待合并内容已清除）。', '⚠️ ' + warn] : ['已合并：' + n + '（三路合并，无冲突，待合并内容已清除）。'] }
       }
-      const dir = pendingEntryDir(ctx.stateDir, n)
-      const currentPath = join(ctx.repoRoot, n)
-      let current
-      try {
-        current = await readFile(currentPath, 'utf8')
-      } catch (e) {
-        return { code: 1, lines: [n + ' 当前文件不存在（' + e.code + '），无法合并。'] }
-      }
-      let base
-      try {
-        base = await readFile(join(dir, 'base'), 'utf8')
-      } catch {
-        base = null
-      }
-      if (base === null) {
+      if (r.reason === 'no-entry') return { code: 1, lines: [n + ' 没有待合并内容。'] }
+      if (r.reason === 'occupied') return { code: 1, lines: [n + ' 仍被活跃会话占用（' + r.detail + '），先等其 release 再合并。'] }
+      if (r.reason === 'no-file') return { code: 1, lines: [n + ' 当前文件不存在（' + r.detail + '），无法合并。'] }
+      if (r.reason === 'no-base') {
         return { code: 1, lines: [n + ' 缺少 base（写入时无 git HEAD 版本），无法自动合并——请 pending show 查看后手动处理，或 pending drop 丢弃。'] }
       }
-      const other = await readFile(join(dir, 'content'), 'utf8')
-      const merge = ctx.mergeFile || gitMergeFile
-      // 三路合并需要真实文件路径；把 current/base/other 落到临时文件再调 merge。
-      const tmp = join(tmpdir(), 'dsh-apply-' + randomBytes(4).toString('hex'))
-      await mkdir(tmp, { recursive: true })
-      let res
-      try {
-        const curF = join(tmp, 'current')
-        const baseF = join(tmp, 'base')
-        const otherF = join(tmp, 'other')
-        await writeFile(curF, current, 'utf8')
-        await writeFile(baseF, base, 'utf8')
-        await writeFile(otherF, other, 'utf8')
-        res = await merge(curF, baseF, otherF)
-        if (res.ok) {
-          await writeFile(currentPath, res.content, 'utf8')
-          await rmSync(dir, { recursive: true, force: true })
-          const warn = await appendAudit(ctx.stateDir, { at: ctx.now, tag: ctx.tag, type: 'pending-apply', path: n, detail: '已合并' })
-          return { code: 0, lines: warn ? ['已合并：' + n + '（三路合并，无冲突，待合并内容已清除）。', '⚠️ ' + warn] : ['已合并：' + n + '（三路合并，无冲突，待合并内容已清除）。'] }
+      if (r.reason === 'conflicts') {
+        const warn = await appendAudit(ctx.stateDir, { at: ctx.now, tag: ctx.tag, type: 'pending-apply', path: n, detail: '冲突留标记' })
+        return {
+          code: 1,
+          lines: warn
+            ? ['合并冲突：' + n + ' —— 已写入冲突标记到工作树，请手动解决后执行 pending drop ' + n + ' 清理。', '⚠️ ' + warn]
+            : ['合并冲突：' + n + ' —— 已写入冲突标记到工作树，请手动解决后执行 pending drop ' + n + ' 清理。'],
         }
-        if (res.conflicts) {
-          await writeFile(currentPath, res.content, 'utf8')
-          const warn = await appendAudit(ctx.stateDir, { at: ctx.now, tag: ctx.tag, type: 'pending-apply', path: n, detail: '冲突留标记' })
-          return {
-            code: 1,
-            lines: warn
-              ? ['合并冲突：' + n + ' —— 已写入冲突标记到工作树，请手动解决后执行 pending drop ' + n + ' 清理。', '⚠️ ' + warn]
-              : ['合并冲突：' + n + ' —— 已写入冲突标记到工作树，请手动解决后执行 pending drop ' + n + ' 清理。'],
-          }
-        }
-        return { code: 1, lines: ['合并失败：' + n + ' —— ' + (res.message || '未知错误')] }
-      } finally {
-        rmSync(tmp, { recursive: true, force: true })
       }
+      return { code: 1, lines: ['合并失败：' + n + ' —— ' + (r.detail || '未知错误')] }
     })
   }
 

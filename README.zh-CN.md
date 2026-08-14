@@ -19,7 +19,8 @@
 - **claim / release** —— 会话在编辑前声明对文件路径的独占认领。
 - **心跳 + stale 接管** —— 心跳自动刷新；崩溃会话的认领过期（默认 2h）后可用 `--force` 接管。
 - **异步 pending 合并区** —— 不阻塞：会话把「改好的新内容 + git HEAD base」写入待合并区；
-  持有者 release 后 `pending apply` 做 **git 三路合并**（current × base × pending），无冲突自动落盘。
+  持有者 release 后**自动尝试** **git 三路合并**（current × base × pending），无冲突即落盘；
+  冲突时 `pending apply` 手动处理。
 - **写入守卫** —— `tools/pre-execute` 拒绝写他人活跃认领文件的工具调用（协作式、尽力而为——
   shell 写入无法完全拦截）。
 - **零自动化负担** —— `agent/created` / `agent/status` 自动刷新心跳，`agent/disposed`
@@ -62,8 +63,10 @@ dsh plugin --profile web add -w link:<仓库路径>
 2. **放心写。** 自己的认领永不阻塞自己；写入被*其他*活跃会话认领的文件会被拒绝，并附带提示
    （等待 / 对方 stale 后接管 / 写入 pending）。
 3. **文件被占？别干等——写入 pending。** 用 `pending_write` 把改好的内容（含 git HEAD base）
-   放进待合并区。持有者 `release_files` 后，`pending_apply` 干净三路合并落盘。
-4. **写完释放。** `release_files` 清空认领，并运行解锁检查：指向你的待合并条目会浮出提示。
+   放进待合并区。持有者 `release_files` 后自动三路合并（无冲突即落盘）；冲突时 `pending_apply`
+   手动处理。
+4. **写完释放。** `release_files` 清空认领，并运行解锁检查：指向你的待合并条目会**自动尝试
+   合并**（无冲突即落盘），无法自动合并的浮出提示。
 
 ```text
 claim_files({ paths: ["README.md", "src/"] })
@@ -153,7 +156,9 @@ apply 语义（`pending_apply`）：用 `git merge-file` 对 `current × base ×
 合并结果落盘且条目**保留**供手动解决；缺 base → 拒绝，绝不盲合；任一会话仍活跃占用 →
 拒绝直至释放。
 
-`release_files` 带解锁检查：指向被释放路径（或释放会话）的待合并条目会出现在释放输出中。
+`release_files` 带解锁检查：指向被释放路径（或释放会话）的待合并条目会**自动尝试三路合并**
+——无冲突即落盘并清除条目；无法自动合并（仍被占用 / 缺 base / 冲突 / 文件缺失）的条目保留，
+并附 `pending_apply` / `pending_show` / `pending_drop` 手动处理提示。
 
 ## 拦截边界
 
