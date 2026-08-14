@@ -210,7 +210,7 @@ test('pending：无占用拒绝；有活跃占用可写入；list/show/drop 工�
     expect(list, 0, 'README.md', 's-b')
     const show = await run(['pending', 'show', 'README.md'], { stateDir: dir, repoRoot: root })
     expect(show, 0, '改好的 README 内容')
-    const drop = await run(['pending', 'drop', 'README.md'], { stateDir: dir, repoRoot: root })
+    const drop = await run(['pending', 'drop', '--as', 's-b', 'README.md'], { stateDir: dir, repoRoot: root })
     expect(drop, 0, '已丢弃')
     const list2 = await run(['pending', 'list'], { stateDir: dir, repoRoot: root })
     expect(list2, 0, '待合并区为空')
