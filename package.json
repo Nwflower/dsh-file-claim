@@ -1,0 +1,51 @@
+{
+  "name": "dsh-file-claim",
+  "description": "File claim / protection for concurrent DeepSeek Harness sessions working the same workspace: claim/release, heartbeat stale takeover, and an async pending merge area (git 3-way merge)",
+  "version": "0.0.0",
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.mjs",
+    "cordis.patch.yml",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "0.1.0-rc.6"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh-plugin",
+    "dsh",
+    "file-claim",
+    "file-lock",
+    "concurrency",
+    "parallel-sessions",
+    "coordination",
+    "merge"
+  ],
+  "author": "Nwflower <1679659@qq.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Nwflower/dsh-file-claim.git"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\"",
+    "prepublishOnly": "npm test && git diff --quiet && git diff --cached --quiet && npm pack --dry-run"
+  },
+  "license": "MIT"
+}

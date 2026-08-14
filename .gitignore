@@ -1,0 +1,17 @@
+# ============ 发布面 / 本地工程面 分离 ============
+# 仓库根目录只放发布到 GitHub / npm 的文件：
+#   index.mjs / cordis.patch.yml / package.json / README.md / README.zh-CN.md / LICENSE / test/ / .github/
+# 本地工程文件一律收进 dev/（需求文档、交接文档、评估报告、本地脚本/夹具），不入库、不进 npm 包。
+
+# 本地工程面 —— 整个目录不入库
+dev/
+
+# 本地测试依赖
+node_modules/
+
+# 兜底：根目录若再出现本地会话快照，同样不入库
+.prev-session*.jsonl
+
+# 编辑器 / 系统噪音
+.DS_Store
+*.log
