@@ -37,6 +37,18 @@ The DSH host has no built-in cross-session file protection, and a full scan of 5
 area — write your edit now, merge it cleanly once the owner releases — is unique in the agent
 file-lock category. This is a gap-filler, not a duplicate.
 
+### Compared with the category
+
+Checked against 11 Claude Code / Codex file-lock and coordination tools (claude-code-file-locks,
+parallel-sessions, guardex, agent-orchestrator, blackboard-mcp, mclaude, ruah-orch, knot, …):
+
+| Differentiator | dsh-file-claim | Typical alternatives |
+| --- | --- | --- |
+| Conflict handling | **async pending area + git 3-way merge** — write now, merge cleanly once the owner releases | wait / deny only ("lock → write → release") |
+| Target platform | **DSH-native** — identity, tools, events, guard and slash commands all integrated | Claude Code / Codex hooks; none target DSH |
+| Platform support | zero-dependency Node, **Windows-friendly** | Bash/jq/flock solutions lean macOS/Linux; guardex has no native Windows |
+| Enforcement | cooperative tool-layer guardrail (fail-open, matching the category's de-facto standard) | hook interception / declarative locks; top tools fall back to worktree isolation |
+
 ## Install
 
 ```sh

@@ -32,6 +32,18 @@ DSH 宿主无内建跨会话文件保护；505 个 `dsh-plugin` topic 仓库全�
 文件认领/协调类插件。pending 合并区——现在写下改动、持有者释放后干净合并——在 agent
 文件锁品类内独有。这是**填补空白而非重复造轮子**。
 
+### 与同类方案对比
+
+对照 11 个 Claude Code / Codex 文件锁与协调工具（claude-code-file-locks、parallel-sessions、
+guardex、agent-orchestrator、blackboard-mcp、mclaude、ruah-orch、knot 等）：
+
+| 差异化 | dsh-file-claim | 同类方案 |
+| --- | --- | --- |
+| 冲突处理 | **pending 异步区 + git 三路合并**——先写入、对方释放后干净合并 | 只能等待/拒绝（「锁→写→释放」） |
+| 目标平台 | **DSH 原生**——身份、工具、事件、守卫、命令全集成 | Claude Code / Codex hooks；无一面向 DSH |
+| 平台支持 | 零依赖 Node，**Windows 友好** | Bash/jq/flock 方案偏 macOS/Linux；guardex 无原生 Windows |
+| 强制层 | 工具层协作式护栏（fail-open，与品类事实标准一致） | hook 拦截/声明式锁；头部工具退化为 worktree 硬隔离 |
+
 ## 安装
 
 ```sh
