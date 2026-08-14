@@ -214,6 +214,44 @@ test('拦截：写他人活跃认领文件 deny；自己/未认领/read 放行�
   }
 })
 
+test('拦截回归（bug#extractShellPaths 误报）：引号字面量/只读命令放行，重定向与写 cmdlet 拦截', async () => {
+  const { ctx, tools, listeners } = mockCtx()
+  plugin.apply(ctx, {})
+  const root = await tmpRoot()
+  const a = agent('s-a', root)
+  const b = agent('s-b', root)
+  const next = async () => ({ kind: 'allow' })
+  const pre = listeners.get('tools/pre-execute')[0]
+  const guard = (command, tool = 'bash') => pre({ name: tool, arguments: { command }, agent: b }, next)
+  try {
+    await tools.get('claim_files').execute({ paths: ['README.md'] }, exec(a))
+
+    // 只读 / 数据字面量 → 放行（fail-open，回归点：引号里的路径不是写目标）
+    assert.equal(
+      (await guard("foreach ($f in @('README.md','README.zh.md')) { Write-Output $f }", 'pwsh')).kind,
+      'allow',
+    )
+    assert.equal((await guard("grep -n 'README.md' log.txt")).kind, 'allow')
+    assert.equal((await guard('Get-Content README.md', 'pwsh')).kind, 'allow')
+    assert.equal((await guard('echo README.md')).kind, 'allow')
+
+    // 显式写命令 / 重定向 → 拦截
+    assert.equal((await guard('Set-Content README.md x', 'pwsh')).kind, 'deny')
+    assert.equal((await guard('Set-Content -Path README.md -Value x', 'pwsh')).kind, 'deny')
+    assert.equal((await guard('Add-Content README.md x', 'pwsh')).kind, 'deny')
+    assert.equal((await guard('Out-File -FilePath README.md', 'pwsh')).kind, 'deny')
+    assert.equal((await guard('echo x > README.md')).kind, 'deny')
+    assert.equal((await guard('rm README.md')).kind, 'deny')
+    assert.equal((await guard('tee README.md')).kind, 'deny')
+
+    // 被认领路径只是「源/非目标」→ 放行（只保护写目标）
+    assert.equal((await guard('Copy-Item README.md backup\\', 'pwsh')).kind, 'allow')
+    assert.equal((await guard('mv README.md renamed', 'pwsh')).kind, 'allow')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('agent/disposed 自动释放该会话全部认领', async () => {
   const { ctx, tools, listeners } = mockCtx()
   plugin.apply(ctx, {})

@@ -113,9 +113,12 @@ the session log only, never fed to the model.
 claimed by **another** session. The denial message names the holder and suggests: wait for
 `release_files`, take over with `claim_files(force: true)` once stale, or use `pending_write`.
 `read` is **not** intercepted — reading is observation, not modification, and the claim contract
-only protects the write surface. Shell-path parsing (`bash`/`pwsh`) is best-effort: quoted
-literals and redirection targets are extracted; commands that yield no parseable target pass
-through (fail-open).
+only protects the write surface. Shell-path parsing (`bash`/`pwsh`) is best-effort: only
+**redirection targets** and the target arguments of **explicit write commands** are extracted
+(pwsh `Set-Content` / `Add-Content` / `Out-File` / `New-Item` / `Copy-Item` / `Move-Item` /
+`Remove-Item` / `Rename-Item`; bash `tee` / `dd of=` / `cp` / `mv` / `rm`). Quoted literals are
+**never** treated as write targets — they are data, URLs or patterns, not files being written —
+and commands that yield no parseable target pass through (fail-open).
 
 ## Configuration
 

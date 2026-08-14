@@ -302,16 +302,88 @@ function defineCommands(ctx, config) {
 
 // ---------- 拦截（tools/pre-execute，写面协作护栏） ----------
 
-// 尽力从命令串提取目标路径：引号字面量 + 重定向目标；解析不出 → 放行（fail-open）。
-function extractShellPaths(command) {
-  const out = new Set()
-  for (const m of String(command).matchAll(/(['"])([^'"]+)\1/g)) {
-    const p = m[2]
-    if (p && !p.includes('://') && !/^--/.test(p)) out.add(p)
+// 写命令白名单：pwsh 写 cmdlet（大小写不敏感）+ bash 写命令。
+// 只认这些命令的目标参数与重定向目标为「写目标」；其余（引号字面量、普通参数、
+// 只读命令）一律不算——引号里的路径多半是数据/URL/模式，不是要写的文件。
+const PWSH_WRITE_CMDLETS = new Set([
+  'set-content',
+  'add-content',
+  'out-file',
+  'new-item',
+  'copy-item',
+  'move-item',
+  'remove-item',
+  'rename-item',
+])
+const BASH_WRITE_CMDS = new Set(['tee', 'cp', 'mv', 'rm'])
+const WRITE_OPTION = /^-(path|literalpath|destination|filepath)$/i
+const REDIRECT = /^(?:[12]?>>?|<>)$/
+const CMD_BOUNDARY = /^[|;&]$/
+
+function addWriteTarget(out, p) {
+  if (p && !p.includes('://') && !/^--/.test(p)) out.add(p)
+}
+
+// 写命令的裸参数（位置参数）目标规则：Copy/Move（pwsh 与 bash 同）目标在最后
+// （-Destination 位），Remove 全取（删哪个都是写），其余取第一个（-Path 位）。
+function positionalTargets(cmd, positional) {
+  if (cmd === 'copy-item' || cmd === 'move-item' || cmd === 'cp' || cmd === 'mv') {
+    return positional.length ? [positional[positional.length - 1]] : []
   }
-  for (const m of String(command).matchAll(/(?:^|[\s;|&])(?:[12]?>>?|<>)\s*([^\s;&|<>]+)/g)) {
-    const p = m[1]
-    if (p && !p.includes('://') && !/^--/.test(p)) out.add(p)
+  if (cmd === 'remove-item' || cmd === 'rm') return positional
+  return positional.length ? [positional[0]] : []
+}
+
+// 尽力从 bash/pwsh 命令串提取「写目标」路径：重定向目标 + 显式写命令的目标参数；
+// 解析不出 → 放行（fail-open）。引号字面量绝不视为写目标（防只读命令误报）。
+function extractShellWriteTargets(command) {
+  const out = new Set()
+  const tokens = splitCommandArgs(String(command))
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i]
+    // 重定向目标
+    if (REDIRECT.test(t)) {
+      if (tokens[i + 1] !== undefined) addWriteTarget(out, tokens[i + 1])
+      continue
+    }
+    // dd of=目标
+    if (t === 'dd') {
+      for (let j = i + 1; j < tokens.length && !CMD_BOUNDARY.test(tokens[j]); j++) {
+        const m = /^of=(.+)$/.exec(tokens[j])
+        if (m) addWriteTarget(out, m[1])
+      }
+      continue
+    }
+    const low = t.toLowerCase()
+    if (!PWSH_WRITE_CMDLETS.has(low) && !BASH_WRITE_CMDS.has(low)) continue
+    // 扫描该命令的参数直到命令边界（| ; &）
+    let j = i + 1
+    while (j < tokens.length && !CMD_BOUNDARY.test(tokens[j])) j++
+    const rest = tokens.slice(i + 1, j)
+    const positional = []
+    let afterDoubleDash = false
+    for (let k = 0; k < rest.length; k++) {
+      const tok = rest[k]
+      if (afterDoubleDash) {
+        positional.push(tok)
+        continue
+      }
+      if (tok === '--') {
+        afterDoubleDash = true
+        continue
+      }
+      if (tok.startsWith('-')) {
+        if (WRITE_OPTION.test(tok)) {
+          if (rest[k + 1] !== undefined) addWriteTarget(out, rest[k + 1])
+          k++
+        } else if (rest[k + 1] !== undefined && !rest[k + 1].startsWith('-')) {
+          k++ // 未知选项：跳过其值（防把选项值误当位置参数）
+        }
+      } else {
+        positional.push(tok)
+      }
+    }
+    for (const p of positionalTargets(low, positional)) addWriteTarget(out, p)
   }
   return [...out]
 }
@@ -322,7 +394,7 @@ function targetsOf(name, args) {
     return typeof a.file_path === 'string' ? [a.file_path] : []
   }
   if (name === 'bash' || name === 'pwsh') {
-    return extractShellPaths(typeof a.command === 'string' ? a.command : '')
+    return extractShellWriteTargets(typeof a.command === 'string' ? a.command : '')
   }
   return []
 }

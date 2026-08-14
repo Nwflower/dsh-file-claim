@@ -103,8 +103,10 @@ release_files({ paths: ["README.md"] })
 `tools/pre-execute` 拒绝 `write` / `edit` / `bash` / `pwsh` 调用中目标路径被**其他**活跃会话
 认领的情况。拒绝信息带持有者与建议：等 `release_files`、对方 stale 后 `claim_files(force: true)`
 接管、或 `pending_write` 异步写入。`read` **不拦截**——读取是观察不是修改，认领契约只保护写面。
-shell 路径解析（`bash`/`pwsh`）为尽力而为：提取引号字面量与重定向目标；解析不出目标即放行
-（fail-open）。
+shell 路径解析（`bash`/`pwsh`）为尽力而为：只提取**重定向目标**与**显式写命令的目标参数**
+（pwsh `Set-Content` / `Add-Content` / `Out-File` / `New-Item` / `Copy-Item` / `Move-Item` /
+`Remove-Item` / `Rename-Item`；bash `tee` / `dd of=` / `cp` / `mv` / `rm`）。**引号字面量绝不
+视为写目标**——它们是数据/URL/模式，不是要写的文件；解析不出目标即放行（fail-open）。
 
 ## 配置
 
