@@ -1,7 +1,7 @@
 {
   "name": "dsh-file-claim",
   "description": "File claim / protection for concurrent DeepSeek Harness sessions working the same workspace: claim/release, heartbeat stale takeover, and an async pending merge area (git 3-way merge)",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "type": "module",
   "main": "./index.mjs",
   "exports": {
@@ -22,9 +22,6 @@
     "bundle": {
       "patch": "./cordis.patch.yml"
     }
-  },
-  "peerDependencies": {
-    "@deepseek-ai/dsh-tools": "0.1.0-rc.6"
   },
   "keywords": [
     "deepseek-harness",
