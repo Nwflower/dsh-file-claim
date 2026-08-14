@@ -1,15 +1,17 @@
 // index.mjs — dsh-file-claim 宿主面（唯一依赖 DSH 宿主服务的文件）
 //
-// 职责（REQ-02）：
+// 职责（REQ-02 / REQ-04）：
 //   1. 注册模型工具 claim_files / release_files / who_claims / claim_status /
 //      pending_write / pending_apply / pending_show / pending_drop；
-//   2. 事件挂接：agent/created + agent/status → 自动登记/心跳；agent/disposed →
+//   2. 注册人类命令 /claim /release /claim-status（模型不可用时人工可用，复用
+//      claim.mjs run()，rawInput 引号感知分词；命令入会话日志、不进模型历史）；
+//   3. 事件挂接：agent/created + agent/status → 自动登记/心跳；agent/disposed →
 //      自动释放该会话全部认领；ctx.timer.interval 兜底心跳；
-//   3. tools/pre-execute 拦截：write/edit/bash/pwsh 目标被**其他活跃**会话认领 →
+//   4. tools/pre-execute 拦截：write/edit/bash/pwsh 目标被**其他活跃**会话认领 →
 //      deny（read 不拦截：读取不构成修改，认领只保护写面）；
-//   4. 注册表持久化：工作区本地文件（<repoRoot>/.dsh-file-claim/registry.json，
+//   5. 注册表持久化：工作区本地文件（<repoRoot>/.dsh-file-claim/registry.json，
 //      原子写 + 互斥锁），由 claim.mjs 纯逻辑承担——零 DSH 依赖、跨重启可恢复；
-//   5. 认领根：当前会话 cwd 经 workspaceRegistry.resolveByPath 解析的工作区，无
+//   6. 认领根：当前会话 cwd 经 workspaceRegistry.resolveByPath 解析的工作区，无
 //      工作区时回退 cwd（多仓库并行天然隔离）。
 //
 // 身份：exec.agent.id / agent.id（等价 DSH_SESSION_ID）。失败大声、绝不静默吞掉。
@@ -217,6 +219,87 @@ function defineTools(ctx, config) {
   }
 }
 
+// ---------- 命令注册（REQ-04：模型不可用时人工可用） ----------
+
+// 最小引号感知分词：rawInput → argv（"..." / '...' 内的空白保留，引号剥掉）。
+// 命令行的路径/备注可含空格（如 --note "多 行 备注"）；不用复杂 shell 解析。
+function splitCommandArgs(input) {
+  const out = []
+  let cur = ''
+  let quote = null
+  for (const ch of String(input)) {
+    if (quote) {
+      if (ch === quote) quote = null
+      else cur += ch
+    } else if (ch === '"' || ch === "'") {
+      quote = ch
+    } else if (/\s/.test(ch)) {
+      if (cur) {
+        out.push(cur)
+        cur = ''
+      }
+    } else {
+      cur += ch
+    }
+  }
+  if (cur) out.push(cur)
+  return out
+}
+
+function defineCommands(ctx, config) {
+  const commands = ctx.get('commands')
+  if (!commands || typeof commands.register !== 'function') return
+
+  // 命令处理器与工具同构：身份 + 工作区解析 + claim.mjs run()，只是 argv 来自 rawInput。
+  const makeHandler = (build) => async ({ agent, rawInput }) => {
+    const tag = agentId(agent)
+    if (!tag) {
+      return { kind: 'error', text: '无法确定会话身份：命令缺少 agent。' }
+    }
+    const base = await claimCtx(ctx, config, agent)
+    if (!base) {
+      return { kind: 'error', text: '无法解析会话工作区：缺少会话 cwd。' }
+    }
+    const res = await run(build(splitCommandArgs(rawInput)), {
+      ...base,
+      env: { ...base.env, DSH_SESSION_ID: tag },
+    })
+    return res.code === 0
+      ? { kind: 'success', text: res.lines.join('\n') }
+      : { kind: 'error', text: res.lines.join('\n') }
+  }
+
+  const defs = [
+    {
+      name: 'claim',
+      description: '认领工作区文件/目录路径（独占）：编辑前声明，其他会话不得再修改；对方 stale 后可加 --force 接管。',
+      input: { hint: '<path>... [--note <备注>] [--force]' },
+      build: (argv) => ['claim', ...argv],
+    },
+    {
+      name: 'release',
+      description: '释放本会话的文件认领：/release <path>... 释放指定路径，/release --all 释放全部。',
+      input: { hint: '[<path>... | --all]' },
+      build: (argv) => ['release', ...argv],
+    },
+    {
+      name: 'claim-status',
+      description: '查看当前工作区的会话登记、认领与待合并区总览（只读）。',
+      build: () => ['status'],
+    },
+  ]
+  for (const def of defs) {
+    ctx.effect(() =>
+      commands.register({
+        name: def.name,
+        description: def.description,
+        input: def.input,
+        handler: makeHandler(def.build),
+      }),
+    )
+  }
+}
+
 // ---------- 拦截（tools/pre-execute，写面协作护栏） ----------
 
 // 尽力从命令串提取目标路径：引号字面量 + 重定向目标；解析不出 → 放行（fail-open）。
@@ -311,7 +394,10 @@ export default {
     // 1. 工具
     defineTools(ctx, cfg)
 
-    // 2. 生命周期事件
+    // 2. 人类命令（模型不可用时人工可用）
+    defineCommands(ctx, cfg)
+
+    // 3. 生命周期事件
     ctx.on('agent/created', ({ agent }) => {
       void autoRun(ctx, cfg, agent, ['sync'])
     })

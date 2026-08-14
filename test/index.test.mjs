@@ -1,6 +1,6 @@
 // test/index.test.mjs — index.mjs 宿主面集成测试（mock ctx，零 DSH 宿主依赖）
-// 覆盖：工具注册形状、claim/release/who/status 工具执行、tools/pre-execute 拦截
-// deny/allow、agent/disposed 自动释放、身份解析、pending 工具往返。
+// 覆盖：工具注册形状、claim/release/who/status 工具执行、命令注册与执行、
+// tools/pre-execute 拦截 deny/allow、agent/disposed 自动释放、身份解析、pending 工具往返。
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -13,6 +13,7 @@ import plugin from '../index.mjs'
 
 function mockCtx() {
   const tools = new Map()
+  const commands = new Map()
   const listeners = new Map()
   const disposers = []
   const ctx = {
@@ -44,10 +45,19 @@ function mockCtx() {
         return tools.get(name)
       },
     },
+    commands: {
+      register(def) {
+        commands.set(def.name, def)
+        return () => commands.delete(def.name)
+      },
+      get(name) {
+        return commands.get(name)
+      },
+    },
     timer: { interval: () => () => {} },
     workspaceRegistry: { resolveByPath: async () => undefined },
   }
-  return { ctx, tools, listeners, disposers }
+  return { ctx, tools, commands, listeners, disposers }
 }
 
 function agent(id, cwd) {
@@ -80,6 +90,11 @@ const ALL_TOOLS = [
   'release_files',
   'who_claims',
 ]
+
+const ALL_COMMANDS = ['claim', 'claim-status', 'release']
+
+// 模拟命令分发：handler 只收 invocation，这里直接按 UI 语义构造。
+const invoke = (cmd) => (rawInput, ag) => cmd.handler({ agent: ag, rawInput, signal: new AbortController().signal })
 
 // ---------- 用例 ----------
 
@@ -248,6 +263,65 @@ test('pending 工具往返：write → show → drop（含身份解析）', asyn
     const pd = await tools.get('pending_drop').execute({ path: 'README.md' }, exec(b))
     assert.equal(pd.ok, true)
     assert.ok(pd.lines.some((l) => l.includes('已丢弃')))
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('命令注册：/claim /release /claim-status 契约齐全（name + description + handler）', () => {
+  const { ctx, commands } = mockCtx()
+  plugin.apply(ctx, {})
+  assert.deepEqual([...commands.keys()].sort(), ALL_COMMANDS)
+  for (const name of ALL_COMMANDS) {
+    const def = commands.get(name)
+    assert.equal(typeof def.handler, 'function', name + ' 缺 handler')
+    assert.equal(typeof def.description, 'string', name + ' 缺 description')
+    if (name !== 'claim-status') {
+      assert.equal(typeof def.input.hint, 'string', name + ' 缺 input.hint')
+    }
+  }
+})
+
+test('命令执行：/claim（含引号备注）→ /claim-status → /release --all 往返；无身份拒绝', async () => {
+  const { ctx, commands } = mockCtx()
+  plugin.apply(ctx, {})
+  const root = await tmpRoot()
+  const a = agent('s-a', root)
+  const b = agent('s-b', root)
+  try {
+    const claim = commands.get('claim')
+    const status = commands.get('claim-status')
+    const release = commands.get('release')
+
+    // 无身份 → error
+    const noTag = await invoke(claim)(' README.md', null)
+    assert.equal(noTag.kind, 'error')
+    assert.ok(noTag.text.includes('无法确定会话身份'))
+
+    // /claim README.md --note "多 行 备注"：引号内空白保留为单个备注
+    const c1 = await invoke(claim)(' README.md --note "多 行 备注"', a)
+    assert.equal(c1.kind, 'success', c1.text)
+    assert.ok(c1.text.includes('已认领：README.md'))
+    const reg = JSON.parse(await readFile(join(root, '.dsh-file-claim', 'registry.json'), 'utf8'))
+    assert.equal(reg.sessions['s-a'].note, '多 行 备注')
+
+    // 其他活跃会话 /claim 同一路径 → error
+    const c2 = await invoke(claim)(' README.md', b)
+    assert.equal(c2.kind, 'error')
+    assert.ok(c2.text.includes('认领失败') && c2.text.includes('s-a'))
+
+    // /claim-status 总览
+    const st = await invoke(status)('', b)
+    assert.equal(st.kind, 'success')
+    assert.ok(st.text.includes('会话 s-a'))
+
+    // /release --all 释放
+    const r1 = await invoke(release)(' --all', a)
+    assert.equal(r1.kind, 'success')
+    assert.ok(r1.text.includes('已释放：README.md'))
+    const reg2 = JSON.parse(await readFile(join(root, '.dsh-file-claim', 'registry.json'), 'utf8'))
+    // 带备注的会话释放后保留登记（仅清空认领），与 claim.mjs 语义一致
+    assert.deepEqual(reg2.sessions['s-a'].claims, [])
   } finally {
     await rm(root, { recursive: true, force: true })
   }

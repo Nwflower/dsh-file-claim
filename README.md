@@ -82,6 +82,19 @@ Eight model-facing tools (identity is the calling session — no `--as` needed):
 | `pending_show` | Read-only: view one pending entry's meta and content |
 | `pending_drop` | Discard one pending entry (no merge) |
 
+## Commands
+
+Human-usable slash commands (same semantics as the tools above — useful when the model is
+unavailable, or for shell-bound users). The line after the command name is split quote-aware, so
+paths and notes containing spaces work (`--note "multi word note"`). Command runs are recorded in
+the session log only, never fed to the model.
+
+| Command | Purpose |
+| --- | --- |
+| `/claim <path>... [--note <text>] [--force]` | Claim file/dir paths exclusively; `--force` takes over a stale holder |
+| `/release [<path>... \| --all]` | Release paths or everything |
+| `/claim-status` | Read-only: session registry, claims, pending area overview |
+
 ## Write Guard
 
 `tools/pre-execute` denies `write` / `edit` / `bash` / `pwsh` calls whose target path is actively
@@ -139,7 +152,7 @@ state", matching the fail-open posture of the whole category.
 ## Development
 
 ```sh
-npm test        # node --test: claim.mjs unit tests (16) + index.mjs mock-ctx integration (6)
+npm test        # node --test: claim.mjs unit tests (16) + index.mjs mock-ctx integration (8)
 npm pack --dry-run
 ```
 

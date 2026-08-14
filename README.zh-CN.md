@@ -74,6 +74,18 @@ release_files({ paths: ["README.md"] })
 | `pending_show` | 只读：查看某待合并条目的元信息与内容 |
 | `pending_drop` | 丢弃某待合并条目（不合并） |
 
+## 命令
+
+人工可用的斜杠命令（与上述工具同语义——模型不可用或习惯命令行时使用）。命令名后的行按
+引号感知分词，含空格的路径与备注可用（`--note "多 行 备注"`）。命令执行只记入会话日志，
+绝不进模型历史。
+
+| 命令 | 用途 |
+| --- | --- |
+| `/claim <path>... [--note <备注>] [--force]` | 独占认领文件/目录；`--force` 接管 stale 持有者 |
+| `/release [<path>... \| --all]` | 释放指定路径或全部 |
+| `/claim-status` | 只读：会话登记、认领与待合并区总览 |
+
 ## 写入守卫
 
 `tools/pre-execute` 拒绝 `write` / `edit` / `bash` / `pwsh` 调用中目标路径被**其他**活跃会话
@@ -125,7 +137,7 @@ apply 语义（`pending_apply`）：用 `git merge-file` 对 `current × base ×
 ## 开发
 
 ```sh
-npm test        # node --test：claim.mjs 单测（16）+ index.mjs mock ctx 集成（6）
+npm test        # node --test：claim.mjs 单测（16）+ index.mjs mock ctx 集成（8）
 npm pack --dry-run
 ```
 
