@@ -1,3 +1,12 @@
+# dsh-file-claim bundle 声明：insert 到宿主组合的 dsh-file-claim 插件行。
+# 可选 config（部署时按需覆盖，缺省见 README「Configuration/配置」）：
+#   - id: dsh-file-claim
+#     name: dsh-file-claim
+#     config:
+#       staleMs: 7200000        # 心跳过期阈值（默认 2h）
+#       stateDirName: .dsh-file-claim  # 工作区根下的状态目录名
+#       guard: true             # false 关闭 pre-execute 写入守卫
+#       heartbeatMs: 600000     # 兜底心跳间隔（默认 10min）
 - insert:
     - id: dsh-file-claim
       name: dsh-file-claim

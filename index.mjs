@@ -1,14 +1,354 @@
-// dsh-file-claim — 同一工作区并行 DSH 会话的文件认领/保护插件（骨架阶段）。
+// index.mjs — dsh-file-claim 宿主面（唯一依赖 DSH 宿主服务的文件）
 //
-// 现状：仅导出最小 Cordis 插件契约（name + apply），apply 为空实现。
-// 规划见 dev/REQUIREMENTS.md（REQ-01 claim.mjs 纯逻辑移植；REQ-02 宿主面工具/事件/拦截）。
+// 职责（REQ-02）：
+//   1. 注册模型工具 claim_files / release_files / who_claims / claim_status /
+//      pending_write / pending_apply / pending_show / pending_drop；
+//   2. 事件挂接：agent/created + agent/status → 自动登记/心跳；agent/disposed →
+//      自动释放该会话全部认领；ctx.timer.interval 兜底心跳；
+//   3. tools/pre-execute 拦截：write/edit/bash/pwsh 目标被**其他活跃**会话认领 →
+//      deny（read 不拦截：读取不构成修改，认领只保护写面）；
+//   4. 注册表持久化：工作区本地文件（<repoRoot>/.dsh-file-claim/registry.json，
+//      原子写 + 互斥锁），由 claim.mjs 纯逻辑承担——零 DSH 依赖、跨重启可恢复；
+//   5. 认领根：当前会话 cwd 经 workspaceRegistry.resolveByPath 解析的工作区，无
+//      工作区时回退 cwd（多仓库并行天然隔离）。
+//
+// 身份：exec.agent.id / agent.id（等价 DSH_SESSION_ID）。失败大声、绝不静默吞掉。
+
+import { join } from 'node:path'
+import { mkdtemp, writeFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { run, normPath, loadRegistry, pathConflict } from './claim.mjs'
+
+const DEFAULT_STALE_MS = 2 * 60 * 60 * 1000
+const DEFAULT_STATE_DIR = '.dsh-file-claim'
+const DEFAULT_HEARTBEAT_MS = 10 * 60 * 1000
+
+// 写面工具（read 放行：读取不修改内容）
+const WRITE_TOOLS = new Set(['write', 'edit', 'bash', 'pwsh'])
+
+const OK_OUTPUT_SCHEMA = {
+  type: 'object',
+  properties: {
+    ok: { type: 'boolean', description: '操作是否成功' },
+    lines: { type: 'array', items: { type: 'string' }, description: '输出行' },
+  },
+  required: ['ok', 'lines'],
+  additionalProperties: false,
+}
+
+const PROTOCOL_SECTION = `## 多会话文件认领协议（dsh-file-claim）
+
+同一工作区可能并行运行多个 DSH 会话。编辑文件前先调用 claim_files 认领独占路径；
+写入被其他活跃会话认领的文件会被拦截拒绝。被拒时的三个选择：
+1. 等对方 release_files 后再写；
+2. 对方已 stale（心跳过期）时 claim_files(force: true) 接管；
+3. 用 pending_write 把改好的内容写入待合并区（自动记录 git HEAD base），
+   对方 release 后 pending_apply 做三路合并（current × base × pending）。
+who_claims / claim_status 可随时查看占用；写完 release_files 释放。`
+
+// ---------- 解析与身份 ----------
+
+function agentId(agent) {
+  return agent && typeof agent.id === 'string' ? agent.id : null
+}
+
+// 会话 cwd → 工作区根（workspaceRegistry 解析失败/不可用时回退 cwd）
+async function resolveRepoRoot(ctx, cwd) {
+  const ws = ctx.get('workspaceRegistry')
+  if (ws && typeof ws.resolveByPath === 'function') {
+    try {
+      const w = await ws.resolveByPath(cwd)
+      if (w && typeof w.path === 'string') return w.path
+    } catch {
+      // 解析失败回退 cwd，不阻断
+    }
+  }
+  return cwd
+}
+
+// 构造 claim.mjs run() 的上下文（状态目录 = 工作区根的 .dsh-file-claim/）
+async function claimCtx(ctx, config, agent) {
+  const cwd = agent && agent.session && agent.session.header ? agent.session.header.cwd : undefined
+  if (!cwd) return null
+  const repoRoot = await resolveRepoRoot(ctx, cwd)
+  if (!repoRoot) return null
+  return {
+    stateDir: join(repoRoot, config.stateDirName),
+    repoRoot,
+    env: {},
+    now: Date.now(),
+    staleMs: config.staleMs,
+  }
+}
+
+// ---------- 工具注册（makeClaimTool 工厂） ----------
+
+function makeClaimTool(ctx, config, { name, description, properties, required, build }) {
+  return {
+    name,
+    description,
+    parameters: { type: 'object', properties, ...(required ? { required } : {}) },
+    output: {
+      schema: OK_OUTPUT_SCHEMA,
+      render: (_args, value) => [{ type: 'text', text: value.lines.join('\n') }],
+    },
+    async execute(args, exec) {
+      const tag = agentId(exec.agent)
+      if (!tag) {
+        return { ok: false, lines: ['无法确定会话身份：工具调用缺少 agent。'] }
+      }
+      const base = await claimCtx(ctx, config, exec.agent)
+      if (!base) {
+        return { ok: false, lines: ['无法解析会话工作区：缺少会话 cwd。'] }
+      }
+      let cleanup = null
+      try {
+        const built = await build(args, base)
+        const argv = Array.isArray(built) ? built : built.argv
+        if (!Array.isArray(built)) cleanup = built.cleanup || null
+        const res = await run(argv, { ...base, env: { ...base.env, DSH_SESSION_ID: tag } })
+        return { ok: res.code === 0, lines: res.lines }
+      } catch (e) {
+        return { ok: false, lines: ['错误：' + (e && e.message ? e.message : String(e))] }
+      } finally {
+        if (cleanup) {
+          try {
+            await cleanup()
+          } catch {
+            // 临时文件清理失败不影响结果
+          }
+        }
+      }
+    },
+  }
+}
+
+function defineTools(ctx, config) {
+  const tools = [
+    {
+      name: 'claim_files',
+      description:
+        '认领工作区文件/目录路径（独占）：编辑前调用，其他会话不得再修改。路径越出工作区根被拒绝；被其他活跃会话占用时失败，对方 stale 后可用 force 接管。',
+      properties: {
+        paths: { type: 'array', items: { type: 'string' }, description: '要认领的文件或目录路径（相对工作区根）' },
+        note: { type: 'string', description: '认领备注（可选）' },
+        force: { type: 'boolean', description: '对方会话已 stale 时强制接管（默认 false）' },
+      },
+      required: ['paths'],
+      build: (args) => [
+        'claim',
+        ...(Array.isArray(args.paths) ? args.paths : []),
+        ...(args.force ? ['--force'] : []),
+        ...(args.note !== undefined ? ['--note', String(args.note)] : []),
+      ],
+    },
+    {
+      name: 'release_files',
+      description: '释放本会话的文件认领：release_files({paths:[...]}) 释放指定路径；release_files({all:true}) 释放全部。',
+      properties: {
+        paths: { type: 'array', items: { type: 'string' }, description: '要释放的路径（可选）' },
+        all: { type: 'boolean', description: '释放全部认领（默认 false）' },
+      },
+      build: (args) => ['release', ...(Array.isArray(args.paths) ? args.paths : []), ...(args.all ? ['--all'] : [])],
+    },
+    {
+      name: 'who_claims',
+      description: '查询路径当前被哪些会话认领（只读）。',
+      properties: {
+        paths: { type: 'array', items: { type: 'string' }, description: '要查询的路径' },
+      },
+      required: ['paths'],
+      build: (args) => ['who', ...(Array.isArray(args.paths) ? args.paths : [])],
+    },
+    {
+      name: 'claim_status',
+      description: '查看当前工作区的会话登记、认领与待合并区总览（只读）。',
+      properties: {},
+      build: () => ['status'],
+    },
+    {
+      name: 'pending_write',
+      description:
+        '异步写入待合并区：目标文件被其他活跃会话认领时，把改好的新内容（含 git HEAD base）写入待合并区；对方 release 后可用 pending_apply 三路合并。无活跃占用时拒绝（应直接 claim 后修改）。',
+      properties: {
+        path: { type: 'string', description: '目标文件路径（相对工作区根）' },
+        content: { type: 'string', description: '改好的新文件内容' },
+      },
+      required: ['path', 'content'],
+      async build(args) {
+        const tmp = await mkdtemp(join(tmpdir(), 'dsh-pending-write-'))
+        await writeFile(join(tmp, 'content'), args.content, 'utf8')
+        return {
+          argv: ['pending', args.path, join(tmp, 'content')],
+          cleanup: () => rm(tmp, { recursive: true, force: true }),
+        }
+      },
+    },
+    {
+      name: 'pending_apply',
+      description: '对待合并区条目做三路合并（current × base × pending）落盘；无冲突自动清除条目，冲突写标记留条目。要求目标无活跃占用、存在 base。',
+      properties: {
+        path: { type: 'string', description: '待合并条目路径（相对工作区根）' },
+      },
+      required: ['path'],
+      build: (args) => ['pending', 'apply', args.path],
+    },
+    {
+      name: 'pending_show',
+      description: '查看待合并区条目的元信息与内容（只读）。',
+      properties: {
+        path: { type: 'string', description: '待合并条目路径（相对工作区根）' },
+      },
+      required: ['path'],
+      build: (args) => ['pending', 'show', args.path],
+    },
+    {
+      name: 'pending_drop',
+      description: '丢弃待合并区条目（不落盘）。',
+      properties: {
+        path: { type: 'string', description: '待合并条目路径（相对工作区根）' },
+      },
+      required: ['path'],
+      build: (args) => ['pending', 'drop', args.path],
+    },
+  ]
+  for (const def of tools) {
+    ctx.effect(() => ctx.tools.register(makeClaimTool(ctx, config, def)))
+  }
+}
+
+// ---------- 拦截（tools/pre-execute，写面协作护栏） ----------
+
+// 尽力从命令串提取目标路径：引号字面量 + 重定向目标；解析不出 → 放行（fail-open）。
+function extractShellPaths(command) {
+  const out = new Set()
+  for (const m of String(command).matchAll(/(['"])([^'"]+)\1/g)) {
+    const p = m[2]
+    if (p && !p.includes('://') && !/^--/.test(p)) out.add(p)
+  }
+  for (const m of String(command).matchAll(/(?:^|[\s;|&])(?:[12]?>>?|<>)\s*([^\s;&|<>]+)/g)) {
+    const p = m[1]
+    if (p && !p.includes('://') && !/^--/.test(p)) out.add(p)
+  }
+  return [...out]
+}
+
+function targetsOf(name, args) {
+  const a = args || {}
+  if (name === 'write' || name === 'edit') {
+    return typeof a.file_path === 'string' ? [a.file_path] : []
+  }
+  if (name === 'bash' || name === 'pwsh') {
+    return extractShellPaths(typeof a.command === 'string' ? a.command : '')
+  }
+  return []
+}
+
+async function guardDenyReason(ctx, config, exec) {
+  if (config.guard === false) return null
+  const name = exec && exec.name
+  if (!name || !WRITE_TOOLS.has(name)) return null
+  const agent = exec.agent
+  const tag = agentId(agent)
+  if (!tag) return null
+  const targets = targetsOf(name, exec.arguments)
+  if (targets.length === 0) return null // 解析不出目标 → 放行
+  const cwd = agent && agent.session && agent.session.header ? agent.session.header.cwd : undefined
+  if (!cwd) return null
+  const repoRoot = await resolveRepoRoot(ctx, cwd)
+  const stateDir = join(repoRoot, config.stateDirName)
+  let reg
+  try {
+    reg = await loadRegistry(stateDir)
+  } catch {
+    return null // 注册表不可读 → 放行（不因本插件破坏正常写入）
+  }
+  const now = Date.now()
+  const hits = []
+  for (const t of targets) {
+    const n = normPath(t, repoRoot)
+    if (!n) continue
+    const holders = Object.keys(reg.sessions).filter((s) => s !== tag && pathConflict(reg.sessions[s].claims, [n]))
+    const active = holders.filter((s) => now - reg.sessions[s].lastSeenAt <= config.staleMs)
+    if (active.length > 0) hits.push(n + '（' + active.join('、') + '）')
+  }
+  if (hits.length === 0) return null
+  return (
+    'dsh-file-claim 拦截：' +
+    hits.join('；') +
+    ' 正被其他活跃会话认领，拒绝本次写入。建议：等对方 release_files；或对方已 stale 时 claim_files(force:true) 接管；或用 pending_write 写入待合并区，对方 release 后 pending_apply 三路合并。'
+  )
+}
+
+// ---------- 生命周期：自动登记 / 心跳 / 释放 ----------
+
+async function autoRun(ctx, config, agent, argv) {
+  try {
+    const tag = agentId(agent)
+    if (!tag) return
+    const base = await claimCtx(ctx, config, agent)
+    if (!base) return
+    await run(argv, { ...base, env: { ...base.env, DSH_SESSION_ID: tag } })
+  } catch {
+    // 自动动作失败不阻断宿主（下次心跳/事件重试）
+  }
+}
+
+// ---------- 插件入口 ----------
 
 export default {
   name: 'dsh-file-claim',
-  apply(ctx) {
-    // TODO(REQ-02): ctx.tools.register claim_files / release_files / who_claims / claim_status / pending_*
-    // TODO(REQ-02): agent/created|status|disposed → 自动登记/心跳/释放
-    // TODO(REQ-02): tools/pre-execute → 拒绝写他人活跃认领文件的工具调用
-    // TODO(REQ-02): ctx.storageDomain → claim 注册表持久化（替代 dev/sessions/registry.json）
+  inject: ['tools'],
+  apply(ctx, config = {}) {
+    const cfg = {
+      staleMs: DEFAULT_STALE_MS,
+      stateDirName: DEFAULT_STATE_DIR,
+      guard: true,
+      heartbeatMs: DEFAULT_HEARTBEAT_MS,
+      ...config,
+    }
+
+    // 1. 工具
+    defineTools(ctx, cfg)
+
+    // 2. 生命周期事件
+    ctx.on('agent/created', ({ agent }) => {
+      void autoRun(ctx, cfg, agent, ['sync'])
+    })
+    ctx.on('agent/status', ({ agent }) => {
+      void autoRun(ctx, cfg, agent, ['sync'])
+    })
+    ctx.on('agent/disposed', ({ agent }) => {
+      void autoRun(ctx, cfg, agent, ['release', '--all'])
+    })
+
+    // 兜底心跳：agent/status 事件之外，定期刷新所有活跃会话心跳
+    const timer = ctx.get('timer')
+    if (timer && typeof timer.interval === 'function') {
+      ctx.effect(() =>
+        timer.interval(() => {
+          const agents = ctx.get('agents')
+          if (!agents || typeof agents.list !== 'function') return
+          for (const a of agents.list()) void autoRun(ctx, cfg, a, ['sync'])
+        }, cfg.heartbeatMs),
+      )
+    }
+
+    // 3. 拦截
+    ctx.on('tools/pre-execute', async (exec, next) => {
+      try {
+        const reason = await guardDenyReason(ctx, cfg, exec)
+        if (reason) return { kind: 'deny', reason }
+      } catch {
+        // 守卫自身出错 → 放行（fail-open，不阻断宿主工具面）
+      }
+      return next()
+    })
+
+    // 4. 协议注入（模型在提示词里看到 claim/release/pending 纪律）
+    const systemPrompt = ctx.get('systemPrompt')
+    if (systemPrompt && typeof systemPrompt.section === 'function') {
+      ctx.effect(() => systemPrompt.section({ name: 'dsh-file-claim-protocol', order: 120, text: PROTOCOL_SECTION }))
+    }
   },
 }
