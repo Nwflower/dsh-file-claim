@@ -47,8 +47,10 @@ release_files({ paths: ["README.md"] })  # "done — pending edits auto-merge no
 - 🔒 **claim / release** — a session declares exclusive ownership of file paths before editing
   them; duplicates merge idempotently, directory claims cover descendants, and `'.'` claims the
   whole workspace.
-- ❤️ **heartbeat + stale takeover** — heartbeats refresh automatically via agent lifecycle events;
-  a crashed session's claims expire (default 2h) and can be taken over with `--force`.
+- ❤️ **heartbeat + stale takeover + orphan self-heal** — heartbeats refresh automatically via agent
+  lifecycle events; a crashed / hard-killed session's claims are **cleared immediately on the next
+  activity** (per-process pid check) and swept by the heartbeat interval; `staleMs` expiry (2h,
+  for records without a pid) and `--force` takeover remain as the slow fallback.
 - 🧩 **async pending merge area** — instead of blocking, a session writes its edited content plus
   the git HEAD base into a pending area; when the owner releases, the entry is **auto-merged** via
   a **git 3-way merge** (`current × base × pending`) when conflict-free, or applied manually with
@@ -260,8 +262,11 @@ arguments of explicit write commands are parsed; arbitrary shell, scripts, exter
 IDE/git operations bypass the tool stack. That is the documented cooperative boundary, not a bug —
 see [Enforcement Boundary](#enforcement-boundary).
 
-**How long until a crashed session's claims expire?** `staleMs`, default 2h. Departing sessions
-release automatically via `agent/disposed`, so stale takeover is only a last-resort fallback.
+**How long until a crashed session's claims are cleared?** Normally **immediately**: every session
+record carries its process pid, and any session activity (claim / release / sync / prune) sweeps
+records whose pid is dead — a crash or hard kill is cleaned up on the very next activity, no waiting.
+`agent/disposed` releases normally-departed sessions at once, and `staleMs` (default 2h) is only the
+slow fallback for records without a pid (e.g. written by older versions).
 
 **Does this work across multiple repos?** Yes. The claim root is the workspace resolved from the
 session's cwd (`workspaceRegistry`), falling back to cwd — parallel repos are isolated by design.

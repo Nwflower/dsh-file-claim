@@ -44,8 +44,9 @@ release_files({ paths: ["README.md"] })  # 「改完了」——等待中的 pen
 
 - 🔒 **claim / release** —— 会话在编辑前声明对文件路径的独占认领；重复认领幂等合并，目录
   认领覆盖其下所有路径，`'.'` 认领整个工作区。
-- ❤️ **心跳 + stale 接管** —— 心跳经 agent 生命周期事件自动刷新；崩溃会话的认领过期（默认
-  2h）后可用 `--force` 接管。
+- ❤️ **心跳 + stale 接管 + 孤儿自愈** —— 心跳经 agent 生命周期事件自动刷新；崩溃/强杀的会话
+  认领在**下一次活动时立即清除**（按进程 pid 检查），心跳间隔兜底清扫；`staleMs`（2h，针对
+  无 pid 的旧记录）与 `--force` 接管仍是慢速兜底。
 - 🧩 **异步 pending 合并区** —— 不阻塞：会话把「改好的新内容 + git HEAD base」写入待合并区；
   持有者 release 后**自动尝试** **git 三路合并**（current × base × pending），无冲突即落盘；
   冲突时 `pending apply` 手动处理。
@@ -241,8 +242,10 @@ apply 语义（`pending_apply`）：用 `git merge-file` 对 `current × base ×
 脚本、外部编辑器与 IDE/git 操作都绕过工具栈。这是文档化的协作边界，不是缺陷——见
 [拦截边界](#拦截边界)。
 
-**崩溃会话的认领多久过期？** `staleMs`，默认 2h。离开的会话经 `agent/disposed` 自动释放，
-stale 接管只是最后的兜底。
+**崩溃会话的认领多久清除？** 正常**立即**：每个会话记录携带进程 pid，任何会话活动
+（claim / release / sync / prune）都会清扫 pid 已死的记录——崩溃/强杀在**下一次活动时即刻
+清除**，无需等待。`agent/disposed` 对正常离开的会话即时释放；`staleMs`（默认 2h）只是无 pid
+旧记录（如旧版本写入）的慢速兜底。
 
 **支持多仓库并行吗？** 支持。认领根 = 会话 cwd 解析出的工作区（`workspaceRegistry`），
 无工作区时回退 cwd——多仓库天然隔离。

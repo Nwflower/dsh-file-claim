@@ -477,18 +477,18 @@ async function autoRun(ctx, config, agent, argv) {
     if (!tag) return
     const base = await claimCtx(ctx, config, agent)
     if (!base) return
-    await run(argv, { ...base, env: { ...base.env, DSH_SESSION_ID: tag } })
+    return await run(argv, { ...base, env: { ...base.env, DSH_SESSION_ID: tag } })
   } catch {
     // 自动动作失败不阻断宿主（下次心跳/事件重试）
   }
 }
 
-// prune 不需要会话身份（全局清理该工作区 stale 会话），与 autoRun 分开；失败静默。
+// prune 不需要会话身份（全局清理该工作区 stale/孤儿会话），与 autoRun 分开；失败静默。
 async function autoPrune(ctx, config, agent) {
   try {
     const base = await claimCtx(ctx, config, agent)
     if (!base) return
-    await run(['prune'], { ...base, env: { ...base.env } })
+    return await run(['prune'], { ...base, env: { ...base.env } })
   } catch {
     // 自动动作失败不阻断宿主（下次心跳重试）
   }
@@ -526,18 +526,18 @@ export default {
       void autoRun(ctx, cfg, agent, ['release', '--all'])
     })
 
-    // 兜底心跳：agent/status 事件之外，定期刷新所有活跃会话心跳，并顺带清理 stale 会话
-    // （registry.json 不因带 note 的残留会话无限增长——心跳停止 2h 后自动 prune）。
+    // 兜底心跳：agent/status 事件之外，定期刷新所有活跃会话心跳，并顺带清理 stale/孤儿会话
+    // （registry.json 不因残留会话无限增长）。先串行 sync 全部心跳、再 prune，避免
+    // prune 把「即将被刷新心跳」的活跃会话误判为 stale。
     const timer = ctx.get('timer')
     if (timer && typeof timer.interval === 'function') {
       ctx.effect(() =>
-        timer.interval(() => {
+        timer.interval(async () => {
           const agents = ctx.get('agents')
           if (!agents || typeof agents.list !== 'function') return
-          for (const a of agents.list()) {
-            void autoRun(ctx, cfg, a, ['sync'])
-            void autoPrune(ctx, cfg, a)
-          }
+          const list = agents.list()
+          for (const a of list) await autoRun(ctx, cfg, a, ['sync'])
+          for (const a of list) await autoPrune(ctx, cfg, a)
         }, cfg.heartbeatMs),
       )
     }

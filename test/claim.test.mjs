@@ -392,3 +392,48 @@ test('audit 超限自动轮转（audit.jsonl 不无限增长，保留最近条�
     await rm(root, { recursive: true, force: true })
   }
 })
+
+test('孤儿会话自愈：进程已死的会话在下次活动时立即清除（不等 stale）', async () => {
+  const dir = await tmpState()
+  const root = await tmpState()
+  try {
+    // 跨平台找一个不存在的 pid（Linux pid 1 存活，需动态探测 ESRCH）
+    let deadPid = null
+    for (let p = 1; p <= 8192; p++) {
+      try {
+        process.kill(p, 0)
+      } catch (e) {
+        if (e.code === 'ESRCH') {
+          deadPid = p
+          break
+        }
+      }
+    }
+    assert.ok(deadPid, '应能找到不存在的 pid')
+    await run(['sync', '--as', 's-alive'], { stateDir: dir, repoRoot: root })
+    // 注入崩溃残留：带死 pid 的会话，认领 README.md，且心跳**未过期**（证明靠 pid 而非 stale）
+    const reg = JSON.parse(await readFile(join(dir, 'registry.json'), 'utf8'))
+    reg.sessions['s-crash'] = {
+      startedAt: Date.now() - 1000,
+      lastSeenAt: Date.now() - 1000,
+      claims: ['README.md'],
+      pid: deadPid,
+    }
+    await writeFile(join(dir, 'registry.json'), JSON.stringify(reg, null, 2) + '\n', 'utf8')
+    // s-alive 活动（sync）→ 立即清掉 s-crash（其 pid 已死）
+    const res = await run(['sync', '--as', 's-alive'], { stateDir: dir, repoRoot: root })
+    expect(res, 0)
+    const reg2 = JSON.parse(await readFile(join(dir, 'registry.json'), 'utf8'))
+    assert.equal(reg2.sessions['s-crash'], undefined)
+    assert.ok(reg2.sessions['s-alive']) // 活 pid 的会话保留
+    // 死会话不挡认领：s-alive 可直接认领 README.md
+    const c = await run(['claim', '--as', 's-alive', 'README.md'], { stateDir: dir, repoRoot: root })
+    expect(c, 0, '已认领：README.md')
+    // 审计有 orphan-sweep 记录
+    const au = await run(['audit'], { stateDir: dir, repoRoot: root })
+    expect(au, 0, 'orphan-sweep')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+    await rm(root, { recursive: true, force: true })
+  }
+})

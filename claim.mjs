@@ -211,6 +211,32 @@ async function withLock(stateDir, fn) {
 
 // ---------- 会话身份 ----------
 
+// 进程存活检查（跨平台）：pid 存在返回 true（EPERM = 存在但无权限发信号，也算存活）。
+function isPidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (e) {
+    return e && e.code === 'EPERM'
+  }
+}
+
+// 孤儿会话清理：会话记录了 pid 且该进程已死 → 崩溃/强杀残留，**不等 staleMs 立即清除**。
+// 进程级身份是对「异常中断快速自愈」的补充：任何会话活动（sync/claim/release/prune）都会
+// 触发扫描；无 pid 的旧记录仍走 stale 慢速兜底。同机多实例共享工作区时，一个实例崩溃，
+// 其他实例的活动即清理其残留。
+function sweepOrphans(reg) {
+  const dead = []
+  for (const [tag, s] of Object.entries(reg.sessions)) {
+    if (Number.isInteger(s.pid) && s.pid > 0 && !isPidAlive(s.pid)) {
+      delete reg.sessions[tag]
+      dead.push(tag)
+    }
+  }
+  return dead
+}
+
 export function resolveTag(argv, env) {
   const idx = argv.indexOf('--as')
   const v = idx !== -1 ? argv[idx + 1] : undefined
@@ -279,8 +305,13 @@ async function cmdAudit(ctx, countArg) {
 async function cmdSync(ctx, opts) {
   return withLock(ctx.stateDir, async () => {
     const reg = await loadRegistry(ctx.stateDir)
+    const dead = sweepOrphans(reg)
+    if (dead.length > 0) {
+      await appendAudit(ctx, { at: ctx.now, tag: ctx.tag, type: 'orphan-sweep', paths: dead })
+    }
     const s = reg.sessions[ctx.tag] || { startedAt: ctx.now, claims: [] }
     s.lastSeenAt = ctx.now
+    s.pid = process.pid
     if (opts.note !== undefined) s.note = opts.note
     reg.sessions[ctx.tag] = s
     await saveRegistry(ctx.stateDir, reg)
@@ -300,6 +331,7 @@ async function cmdClaim(ctx, opts, paths) {
   }
   return withLock(ctx.stateDir, async () => {
     const reg = await loadRegistry(ctx.stateDir)
+    const dead = sweepOrphans(reg) // 先清崩溃残留，死会话不再挡认领
     const mine = reg.sessions[ctx.tag] || { startedAt: ctx.now, claims: [] }
     const blockers = Object.keys(reg.sessions).filter((t) => t !== ctx.tag && pathConflict(reg.sessions[t].claims, normed))
     const active = blockers.filter((t) => ctx.now - reg.sessions[t].lastSeenAt <= ctx.staleMs)
@@ -331,10 +363,12 @@ async function cmdClaim(ctx, opts, paths) {
       if (!mine.claims.some((c) => c === n)) mine.claims.push(n)
     }
     mine.lastSeenAt = ctx.now
+    mine.pid = process.pid
     if (opts.note !== undefined) mine.note = opts.note
     reg.sessions[ctx.tag] = mine
     await saveRegistry(ctx.stateDir, reg)
     lines.push('已认领：' + mine.claims.join(', '), '其他会话不得修改这些文件；完成后 release。')
+    if (dead.length > 0) lines.push('已清理孤儿会话（进程已退出）：' + dead.join('、'))
     const warn = await appendAudit(ctx, {
       at: ctx.now,
       tag: ctx.tag,
@@ -350,9 +384,13 @@ async function cmdClaim(ctx, opts, paths) {
 async function cmdRelease(ctx, opts, paths) {
   return withLock(ctx.stateDir, async () => {
     const reg = await loadRegistry(ctx.stateDir)
+    const dead = sweepOrphans(reg)
+    if (dead.length > 0) {
+      await appendAudit(ctx, { at: ctx.now, tag: ctx.tag, type: 'orphan-sweep', paths: dead })
+    }
     const mine = reg.sessions[ctx.tag]
     if (!mine || mine.claims.length === 0) {
-      return { code: 0, lines: ['本会话没有认领可释放。'] }
+      return { code: 0, lines: dead.length ? ['已清理孤儿会话（进程已退出）：' + dead.join('、')] : ['本会话没有认领可释放。'] }
     }
     let toRelease = []
     if (paths.length > 0) {
@@ -410,10 +448,14 @@ async function cmdPrune(ctx) {
     const reg = await loadRegistry(ctx.stateDir)
     const stale = Object.keys(reg.sessions).filter((t) => ctx.now - reg.sessions[t].lastSeenAt > ctx.staleMs)
     for (const t of stale) delete reg.sessions[t]
+    const orphan = sweepOrphans(reg) // 顺带清进程已死的崩溃残留
     await saveRegistry(ctx.stateDir, reg)
-    const lines = [stale.length ? '已清理 stale 会话：' + stale.join('、') : '没有 stale 会话。']
-    if (stale.length > 0) {
-      const warn = await appendAudit(ctx, { at: ctx.now, tag: ctx.tag, type: 'prune', paths: stale })
+    const lines = []
+    if (stale.length > 0) lines.push('已清理 stale 会话：' + stale.join('、'))
+    if (orphan.length > 0) lines.push('已清理孤儿会话（进程已退出）：' + orphan.join('、'))
+    if (lines.length === 0) lines.push('没有 stale 会话。')
+    if (stale.length > 0 || orphan.length > 0) {
+      const warn = await appendAudit(ctx, { at: ctx.now, tag: ctx.tag, type: 'prune', paths: [...stale, ...orphan] })
       if (warn) lines.push('⚠️ ' + warn)
     }
     return { code: 0, lines }
